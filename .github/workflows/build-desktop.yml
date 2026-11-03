@@ -3,6 +3,13 @@ name: Build Desktop
 on:
   push:
     branches: [fix/desktop-interactions]
+    paths:
+      - web/**
+      - desktop/crates/**
+      - desktop/src-tauri/**
+      - desktop/Cargo.toml
+      - desktop/Cargo.lock
+      - .github/workflows/build-desktop.yml
     tags: ["v*"]
   workflow_dispatch:
     inputs:
@@ -239,6 +246,7 @@ jobs:
           ./desktop/scripts/smoke-windows.ps1 -Installer $installer
 
       - name: Windows 按钮交互回归检查
+        timeout-minutes: 12
         if: matrix.os == 'windows-latest'
         shell: powershell
         run: |

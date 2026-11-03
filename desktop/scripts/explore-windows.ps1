@@ -89,7 +89,7 @@ function Click-Control([string]$Name, [string]$Region = 'any') {
         Start-Sleep -Milliseconds 400
         if ($element.Current.IsOffscreen) { throw "Could not scroll control into view: $Name" }
     }
-    $point = [System.Windows.Point]::new()
+    $point = [System.Windows.Point]::new(0, 0)
     $hasPoint = $element.TryGetClickablePoint([ref]$point)
     $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
     $pattern = $null
@@ -133,6 +133,7 @@ function Open-External([string]$Name) {
 }
 function Check([string]$Name, [scriptblock]$Action, [string]$Expected = '') {
     try {
+        @{check=$Name;status='running'} | ConvertTo-Json | Set-Content (Join-Path $evidence 'current-check.json') -Encoding UTF8
         & $Action
         if ($Expected) {
             $contentDeadline = [DateTime]::UtcNow.AddSeconds(15)
@@ -155,6 +156,7 @@ function Check([string]$Name, [scriptblock]$Action, [string]$Expected = '') {
         # Close a failed dialog/picker so subsequent checks can identify independent failures.
         try { [System.Windows.Forms.SendKeys]::SendWait('{ESC}') } catch {}
     }
+    $results | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $evidence 'results.json') -Encoding UTF8
 }
 try {
     $deadline = [DateTime]::UtcNow.AddSeconds(90)
