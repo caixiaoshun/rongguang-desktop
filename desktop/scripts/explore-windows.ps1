@@ -1,0 +1,152 @@
+﻿param(
+    [Parameter(Mandatory = $true)][string]$Installer,
+    [Parameter(Mandatory = $true)][string]$OutputDir
+)
+$ErrorActionPreference = "Stop"
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class AuditMouse {
+  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+  [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
+}
+'@
+$evidence = Join-Path $OutputDir "evidence"
+New-Item -ItemType Directory -Force $evidence | Out-Null
+$installDir = Join-Path $OutputDir "install"
+$setup = Start-Process -FilePath $Installer -ArgumentList @('/S', "/D=$installDir") -PassThru -Wait
+if ($setup.ExitCode -ne 0) { throw "Installer failed" }
+$env:FUSION_DATA_DIR = Join-Path $OutputDir "data"
+$env:FUSION_WEB_DIR = Join-Path $installDir "web"
+$env:FUSION_PORT = "0"
+$app = Start-Process (Join-Path $installDir 'rongguang.exe') -WorkingDirectory $installDir -PassThru
+$results = [System.Collections.Generic.List[object]]::new()
+$script:sequence = 0
+$script:lastState = ""
+
+function Get-Elements {
+    $app.Refresh()
+    if ($app.HasExited -or -not $app.Responding) { throw "Application exited or stopped responding" }
+    $script:root = [System.Windows.Automation.AutomationElement]::FromHandle($app.MainWindowHandle)
+    return $script:root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+}
+function Get-Text {
+    return ((Get-Elements | ForEach-Object { try { $_.Current.Name } catch {} }) -join "`n")
+}
+function Save-State([string]$Label) {
+    $script:sequence++
+    $stem = '{0:D3}-{1}' -f $script:sequence, ($Label -replace '[^a-zA-Z0-9_-]', '_')
+    $script:lastState = $stem
+    $rows = @(Get-Elements | ForEach-Object {
+        try { [ordered]@{ name=$_.Current.Name; type=$_.Current.ControlType.ProgrammaticName; enabled=$_.Current.IsEnabled; offscreen=$_.Current.IsOffscreen; id=$_.Current.AutomationId } } catch {}
+    })
+    $rows | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $evidence "$stem.json") -Encoding UTF8
+    try {
+        $area = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+        $bmp = [System.Drawing.Bitmap]::new($area.Width, $area.Height)
+        $graphics = [System.Drawing.Graphics]::FromImage($bmp)
+        try { $graphics.CopyFromScreen($area.Location, [System.Drawing.Point]::Empty, $area.Size); $bmp.Save((Join-Path $evidence "$stem.png"), [System.Drawing.Imaging.ImageFormat]::Png) }
+        finally { $graphics.Dispose(); $bmp.Dispose() }
+    } catch { Write-Warning $_ }
+    return ($rows.name -join "`n")
+}
+function Click-Control([string]$Name, [string]$Region = 'any') {
+    $key = $Name -replace '\s', ''
+    $matches = @(Get-Elements | Where-Object {
+        try {
+            $n = $_.Current.Name -replace '\s', ''
+            $b = $_.Current.BoundingRectangle
+            $_.Current.IsEnabled -and -not $_.Current.IsOffscreen -and ($n -eq $key -or $n -eq "$key$key") -and
+            ($Region -ne 'header' -or $b.Top -lt 120) -and
+            ($Region -ne 'sidebar' -or ($b.Top -gt 110 -and $b.Left -lt 320))
+        } catch { $false }
+    })
+    $controls = @($matches | Where-Object { $_.Current.ControlType.ProgrammaticName -match 'Button|Hyperlink|TabItem|MenuItem|RadioButton' })
+    if ($controls.Count -gt 0) { $matches = $controls }
+    if ($matches.Count -eq 0) { throw "Control not found: $Name ($Region)" }
+    if ($controls.Count -gt 1) { throw "Ambiguous control: $Name ($Region), $($controls.Count) matches" }
+    $element = $matches[0]
+    $pattern = $null
+    if ($element.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pattern)) {
+        ([System.Windows.Automation.InvokePattern]$pattern).Invoke()
+    } elseif ($element.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$pattern)) {
+        ([System.Windows.Automation.SelectionItemPattern]$pattern).Select()
+    } else {
+        $point = $element.GetClickablePoint()
+        [AuditMouse]::SetCursorPos([int]$point.X, [int]$point.Y) | Out-Null
+        [AuditMouse]::mouse_event(2,0,0,0,[UIntPtr]::Zero)
+        [AuditMouse]::mouse_event(4,0,0,0,[UIntPtr]::Zero)
+    }
+    Start-Sleep -Milliseconds 1200
+}
+function Check([string]$Name, [scriptblock]$Action, [string]$Expected = '') {
+    try {
+        & $Action
+        $text = Save-State $Name
+        if ($Expected -and -not $text.Contains($Expected)) { throw "Expected content missing: $Expected" }
+        if ($text -match 'Application error|应用运行异常|顶部导航加载失败|侧边栏运行异常|请求失败|加载失败|发生了意外错误') { throw "UI reported an error: $($Matches[0])" }
+        $results.Add([ordered]@{check=$Name;status='passed';evidence=$script:lastState})
+        Write-Host "PASS: $Name"
+    } catch {
+        $errorText = $_.ToString()
+        try { Save-State "$Name-failure" | Out-Null } catch {}
+        $results.Add([ordered]@{check=$Name;status='failed';error=$errorText;evidence=$script:lastState})
+        Write-Warning "$Name`: $errorText"
+    }
+}
+try {
+    $deadline = [DateTime]::UtcNow.AddSeconds(90)
+    do {
+        Start-Sleep -Milliseconds 500
+        $app.Refresh()
+        if ($app.HasExited) { throw "App exited during startup" }
+    } until (($app.MainWindowHandle -ne 0 -and $app.MainWindowTitle -eq '融光 · AI 视频创作工作台') -or [DateTime]::UtcNow -gt $deadline)
+    $port = (Get-Content (Join-Path $env:FUSION_DATA_DIR 'runtime-port') -Raw).Trim()
+    $origin = "http://127.0.0.1:$port"
+    Check 'initial' {} '最近项目'
+    Check 'theme-light' { Click-Control '切换主题' }
+    Check 'theme-dark' { Click-Control '切换主题' }
+    Check 'analytics' { Click-Control '数据分析' 'sidebar' } '数据分析'
+    Check 'dashboard' { Click-Control '总览' 'sidebar' } '最近项目'
+    Check 'projects' { Click-Control '项目' 'header' } '项目管理'
+    Check 'create-project-dialog' { Click-Control '新建项目' } '创建项目'
+    Check 'cancel-project-dialog' { Click-Control '取消' } '项目管理'
+    # Fixtures exist only in this clean CI data directory; no user files or paid models.
+    $fixture = Invoke-RestMethod "$origin/api/project" -Method Post -ContentType 'application/json' -Body '{"name":"UI-AUDIT-Test","description":"Disposable interaction audit fixture"}'
+    Check 'reload-dashboard' { Click-Control '仪表盘' 'header' } '最近项目'
+    Check 'reload-projects' { Click-Control '项目' 'header' } 'UI-AUDIT-Test'
+    Check 'project-overview' { Click-Control 'UI-AUDIT-Test' } '剧本'
+    Check 'project-scripts' { Click-Control '剧本' 'sidebar' } '剧本'
+    Check 'project-storyboards' { Click-Control '分镜' 'sidebar' } '分镜'
+    Check 'project-assets' { Click-Control '资产' 'sidebar' } '资产'
+    Check 'project-settings' { Click-Control '设置' 'sidebar' } '设置'
+    Check 'global-assets' { Click-Control '资产' 'header' } '素材资产'
+    Check 'image-workbench' { Click-Control '工具' 'header' } '生图'
+    Check 'video-workbench' { Click-Control '生视频' 'sidebar' } '生视频'
+    Check 'settings' { Click-Control '系统设置' 'header' } '个人设置'
+    foreach ($name in @('通用设置','用户列表','个人设置','AI 配置','智能体配置','存储配置')) {
+        $label = $name
+        Check ("settings-" + [Array]::IndexOf(@('通用设置','用户列表','个人设置','AI 配置','智能体配置','存储配置'), $name)) { Click-Control $label 'sidebar' } $label
+    }
+    Check 'storage-add' { Click-Control '添加存储配置' } '存储'
+    Check 'storage-cancel' { Click-Control '取消' } '存储配置'
+    Check 'ai-settings' { Click-Control 'AI 配置' 'sidebar' } 'AI 配置'
+    Check 'api-add' { Click-Control '添加 API 配置' } 'API'
+    Check 'api-cancel' { Click-Control '取消' } 'AI 配置'
+    Check 'assistant-home' { Click-Control '仪表盘' 'header' } '最近项目'
+    Check 'assistant-open' { Click-Control '打开融光助手' } '新对话'
+    Check 'assistant-history' { Click-Control '打开会话列表' }
+    Check 'assistant-history-close' { [System.Windows.Forms.SendKeys]::SendWait('{ESC}'); Start-Sleep -Milliseconds 500 }
+    Check 'github-link' { Click-Control '打开 GitHub 仓库'; Start-Sleep -Seconds 3 }
+} finally {
+    $results | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $evidence 'results.json') -Encoding UTF8
+    if (Test-Path (Join-Path $env:FUSION_DATA_DIR 'logs')) { Copy-Item (Join-Path $env:FUSION_DATA_DIR 'logs') (Join-Path $evidence 'logs') -Recurse -Force }
+    if (-not $app.HasExited) { Stop-Process -Id $app.Id -Force }
+}
+$failed = @($results | Where-Object { $_.status -eq 'failed' })
+Write-Host "Interaction results: $($results.Count) checks, $($failed.Count) failures"
+if ($failed.Count -gt 0) { exit 1 }
