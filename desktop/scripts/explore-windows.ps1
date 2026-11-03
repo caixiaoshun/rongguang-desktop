@@ -56,7 +56,7 @@ function Save-State([string]$Label) {
     } catch { Write-Warning $_ }
     return ($rows.name -join "`n")
 }
-function Click-Control([string]$Name, [string]$Region = 'any') {
+function Click-Control([string]$Name, [string]$Region = 'any', [string]$Method = 'mouse') {
     $key = $Name -replace '\s', ''
     $controlDeadline = [DateTime]::UtcNow.AddSeconds(10)
     do {
@@ -94,7 +94,14 @@ function Click-Control([string]$Name, [string]$Region = 'any') {
     $hasPoint = $element.TryGetClickablePoint([ref]$point)
     $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
     $pattern = $null
-    if ($hasPoint -and $screen.Contains([int]$point.X, [int]$point.Y)) {
+    if ($Method -eq 'keyboard') {
+        [AuditMouse]::SetForegroundWindow($app.MainWindowHandle) | Out-Null
+        $element.SetFocus()
+        [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+    } elseif ($Method -eq 'accessibility') {
+        if (-not $element.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pattern)) { throw "No accessibility activation for $Name" }
+        ([System.Windows.Automation.InvokePattern]$pattern).Invoke()
+    } elseif ($hasPoint -and $screen.Contains([int]$point.X, [int]$point.Y)) {
         [AuditMouse]::SetForegroundWindow($app.MainWindowHandle) | Out-Null
         [AuditMouse]::SetCursorPos([int]$point.X, [int]$point.Y) | Out-Null
         [AuditMouse]::mouse_event(2,0,0,0,[UIntPtr]::Zero)
@@ -122,9 +129,9 @@ function Type-Control([string]$Name, [string]$Text) {
     [System.Windows.Forms.SendKeys]::SendWait($Text)
     Start-Sleep -Milliseconds 600
 }
-function Open-External([string]$Name) {
+function Open-External([string]$Name, [string]$Method = 'mouse') {
     $before = @(Get-ChildItem (Join-Path $env:FUSION_DATA_DIR 'logs') -File | Select-String 'external_url_opened').Count
-    Click-Control $Name
+    Click-Control $Name 'any' $Method
     $immediate = Save-State ("external-" + $Name)
     if ($immediate -match '运行异常|异步任务发生异常|not allowed|无法打开链接|forbidden') { throw "External link error: $immediate" }
     Start-Sleep -Seconds 2
@@ -132,7 +139,7 @@ function Open-External([string]$Name) {
     if ($after -le $before) { throw "Native browser opener did not report success: $Name" }
     [AuditMouse]::SetForegroundWindow($app.MainWindowHandle) | Out-Null
 }
-function Check([string]$Name, [scriptblock]$Action, [string]$Expected = '') {
+function Check([string]$Name, [scriptblock]$Action, [string[]]$Expected = @()) {
     try {
         @{check=$Name;status='running'} | ConvertTo-Json | Set-Content (Join-Path $evidence 'current-check.json') -Encoding UTF8
         & $Action
@@ -140,12 +147,14 @@ function Check([string]$Name, [scriptblock]$Action, [string]$Expected = '') {
             $contentDeadline = [DateTime]::UtcNow.AddSeconds(15)
             do {
                 $currentText = Get-Text
-                if ($currentText.Contains($Expected)) { break }
+                $missing = @($Expected | Where-Object { -not $currentText.Contains($_) })
+                if ($missing.Count -eq 0) { break }
                 Start-Sleep -Milliseconds 300
             } until ([DateTime]::UtcNow -gt $contentDeadline)
         }
         $text = Save-State $Name
-        if ($Expected -and -not $text.Contains($Expected)) { throw "Expected content missing: $Expected" }
+        $missing = @($Expected | Where-Object { -not $text.Contains($_) })
+        if ($missing.Count -gt 0) { throw "Expected content missing: $($missing -join ', ')" }
         if ($text -match 'Application error|运行异常|异步任务发生异常|Cannot read properties|not allowed by ACL|无法打开链接|顶部导航加载失败|请求失败|加载失败|发生了意外错误') { throw "UI reported an error: $($Matches[0])" }
         $results.Add([ordered]@{check=$Name;status='passed';evidence=$script:lastState})
         Write-Host "PASS: $Name"
@@ -175,7 +184,7 @@ try {
     Check 'initial' {} '最近项目'
     Check 'theme-light' { Click-Control '切换主题' }
     Check 'theme-dark' { Click-Control '切换主题' }
-    Check 'task-center-open' { Click-Control '打开任务中心' }
+    Check 'task-center-open' { Click-Control '打开任务中心' } 'AI 任务中心'
     Check 'task-center-close' { Click-Control '关闭任务中心' }
     Check 'user-menu-open' { Click-Control '打开用户菜单' } '个人设置'
     Check 'user-menu-settings' { Click-Control '个人设置' } '个人设置'
@@ -252,10 +261,10 @@ try {
     Check 'api-cancel' { Click-Control '取消' } 'AI 配置'
     Check 'assistant-home' { Click-Control '仪表盘' 'header' } '最近项目'
     Check 'assistant-open' { Click-Control '打开融光助手' } '新对话'
-    Check 'assistant-history' { Click-Control '打开会话列表' }
+    Check 'assistant-history' { Click-Control '打开会话列表' } '还没有助手会话'
     Check 'assistant-history-close' { [System.Windows.Forms.SendKeys]::SendWait('{ESC}'); Start-Sleep -Milliseconds 500 }
-    Check 'assistant-project-picker' { Type-Control '助手消息；输入 @ 引用项目，输入 / 引用 Skill 或 MCP' '@' } 'UI-AUDIT-Test'
-    Check 'assistant-skill-picker' { Type-Control '助手消息；输入 @ 引用项目，输入 / 引用 Skill 或 MCP' '/' } 'UI Audit Skill'
+    Check 'assistant-project-picker' { Type-Control '助手消息；输入 @ 引用项目，输入 / 引用 Skill 或 MCP' '@' } @('引用项目', 'UI-AUDIT-Test')
+    Check 'assistant-skill-picker' { Type-Control '助手消息；输入 @ 引用项目，输入 / 引用 Skill 或 MCP' '/' } @('引用 Skill 或 MCP', 'UI Audit Skill')
     Check 'assistant-clear-input' { Type-Control '助手消息；输入 @ 引用项目，输入 / 引用 Skill 或 MCP' '{BACKSPACE}' }
     Check 'assistant-maximize' { Click-Control '最大化' } '恢复窗口'
     Check 'assistant-restore' { Click-Control '恢复窗口' } '最大化'
@@ -263,6 +272,8 @@ try {
     Check 'assistant-reopen' { Click-Control '打开融光助手' } '新对话'
     Check 'assistant-close-again' { Click-Control '收起助手' } '打开融光助手'
     Check 'github-link' { Open-External '打开 GitHub 仓库' }
+    Check 'github-link-keyboard' { Open-External '打开 GitHub 仓库' 'keyboard' }
+    Check 'github-link-accessibility' { Open-External '打开 GitHub 仓库' 'accessibility' }
 } finally {
     $results | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $evidence 'results.json') -Encoding UTF8
     if (Test-Path (Join-Path $env:FUSION_DATA_DIR 'logs')) { Copy-Item (Join-Path $env:FUSION_DATA_DIR 'logs') (Join-Path $evidence 'logs') -Recurse -Force }

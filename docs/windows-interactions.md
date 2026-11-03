@@ -24,7 +24,7 @@
 | 工具与资产 | 全局素材资产、生图与生视频工作台入口 |
 | 设置 | 六个侧栏页面；API、存储、Skill、MCP 弹窗；创建并编辑测试 Skill；Release 外链 |
 | 助手 | 打开、历史列表、`@` 项目选择器、`/` Skill 选择器、清空输入、最大化/恢复、关闭/重开 |
-| 外链 | GitHub 和 Release 链接均要求原生浏览器命令返回成功，并检查界面无 ACL / 异步异常提示 |
+| 外链 | GitHub 支持鼠标、键盘和辅助功能激活；GitHub 和 Release 链接均要求原生浏览器命令返回成功，并检查界面无 ACL / 异步异常提示 |
 
 每项记录结果、界面可访问树和截图。构建工作流在 Windows 原有的重复启动、响应性、退出和端口冲突检查后，运行完整交互回归；失败时仍上传 `desktop-interaction-evidence` 和启动诊断。
 
@@ -32,7 +32,7 @@
 
 ## 本地复现
 
-在有桌面会话、WebView2 和 Windows PowerShell 的机器上，用新目录执行：
+在有桌面会话、WebView2 和 Windows PowerShell 的机器上，使用待验证构建的安装包和新输出目录执行。已发布的原版 v0.1.4 是已知失败基线，与同名的测试构建应分开：
 
 ```powershell
 ./desktop/scripts/explore-windows.ps1 -Installer 'C:\Downloads\RongGuang_0.1.4_x64-setup.exe' -OutputDir "$env:TEMP\rongguang-interactions-test"
