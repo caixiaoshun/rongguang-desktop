@@ -130,9 +130,20 @@ function Type-Control([string]$Name, [string]$Text) {
     if ($controls.Count -ne 1) { throw "Expected one input: $Name, found $($controls.Count)" }
     [AuditMouse]::SetForegroundWindow($app.MainWindowHandle) | Out-Null
     $controls[0].SetFocus()
-    [System.Windows.Forms.Clipboard]::SetText($Text)
-    try { [System.Windows.Forms.SendKeys]::SendWait('^a'); [System.Windows.Forms.SendKeys]::SendWait('^v') }
-    finally { [System.Windows.Forms.Clipboard]::Clear() }
+    [System.Windows.Forms.SendKeys]::SendWait('^a')
+    if ($Text -eq $secret) {
+        # Password fields do not expose their value through accessibility. Type
+        # the protected value without relying on asynchronous clipboard reads.
+        $escaped = [regex]::Replace($Text, '[+^%~(){}\[\]]', { param($match) '{' + $match.Value + '}' })
+        [System.Windows.Forms.SendKeys]::SendWait($escaped)
+    } else {
+        [System.Windows.Forms.Clipboard]::SetText($Text)
+        try {
+            Start-Sleep -Milliseconds 200
+            [System.Windows.Forms.SendKeys]::SendWait('^v')
+            Start-Sleep -Milliseconds 600
+        } finally { [System.Windows.Forms.Clipboard]::Clear() }
+    }
     Start-Sleep -Milliseconds 500
 }
 function Open-External([string]$Name, [string]$Method = 'mouse') {
@@ -281,6 +292,7 @@ try {
         $config = $configs | Where-Object { $_.platform -eq 'grok' } | Select-Object -First 1
         if ($config.apiKey -ne $secret -or $config.apiUrl.TrimEnd('/') -ne ([string]$credentials.base_url).TrimEnd('/')) { throw 'Configuration was not persisted correctly' }
     } '添加 API 配置'
+    if ($results[$results.Count - 1].status -ne 'passed') { throw 'Live tests blocked because UI configuration did not succeed' }
     Check 'fetch-models-through-ui' {
         Click-Control '获取可用模型列表'
         $discovery = Get-Content (Join-Path $evidence 'provider-models.json') -Raw -Encoding UTF8 | ConvertFrom-Json
