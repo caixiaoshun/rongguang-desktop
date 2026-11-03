@@ -37,7 +37,15 @@ jobs:
           if ('${{ github.event_name }}' -eq 'push') {
             $sourceSha = git log -1 --format=%H -- web desktop/crates desktop/src-tauri desktop/Cargo.toml desktop/Cargo.lock
             $runId = gh api "repos/$env:GITHUB_REPOSITORY/actions/workflows/build-desktop.yml/runs?head_sha=$sourceSha&per_page=10" --jq '.workflow_runs | map(select(.status == "completed")) | .[0].id'
-            if ($LASTEXITCODE -ne 0 -or -not $runId -or $runId -eq 'null') { throw "No completed build for application source $sourceSha" }
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot query source build' }
+            if (-not $runId -or $runId -eq 'null') {
+              if ($sourceSha -eq $env:GITHUB_SHA) {
+                Write-Host 'Application source changed; Build Desktop will build and run the same interaction checks.'
+                'skip=true' >> $env:GITHUB_OUTPUT
+                exit 0
+              }
+              throw "No completed build for application source $sourceSha"
+            }
           }
           if ($runId) {
             $buildSha = gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$runId" --jq '.head_sha'
@@ -48,26 +56,27 @@ jobs:
           }
           "run_id=$runId" >> $env:GITHUB_OUTPUT
       - name: Download published installer
-        if: steps.source.outputs.run_id == ''
+        if: steps.source.outputs.skip != 'true' && steps.source.outputs.run_id == ''
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.tag || 'v0.1.4' }}
         run: gh release download "$env:RELEASE_TAG" --pattern '*x64-setup.exe' --dir artifacts
       - uses: actions/download-artifact@v4
-        if: steps.source.outputs.run_id != ''
+        if: steps.source.outputs.skip != 'true' && steps.source.outputs.run_id != ''
         with:
           name: rongguang-windows-x64
           path: artifacts
           run-id: ${{ steps.source.outputs.run_id }}
           github-token: ${{ github.token }}
       - name: Click through the installed desktop app
+        if: steps.source.outputs.skip != 'true'
         shell: powershell
         run: |
           $installer = (Get-ChildItem artifacts -Filter '*-setup.exe' | Select-Object -First 1).FullName
           ./desktop/scripts/explore-windows.ps1 -Installer $installer -OutputDir "$env:RUNNER_TEMP/interaction-audit"
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: always() && steps.source.outputs.skip != 'true'
         with:
           name: desktop-interaction-evidence
           path: ${{ runner.temp }}/interaction-audit/evidence/**

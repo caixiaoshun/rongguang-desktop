@@ -11,6 +11,7 @@ Add-Type @'
 using System;
 using System.Runtime.InteropServices;
 public static class AuditMouse {
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr handle, int command);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr handle);
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
   [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
@@ -129,7 +130,7 @@ function Open-External([string]$Name) {
     Start-Sleep -Seconds 2
     $after = @(Get-ChildItem (Join-Path $env:FUSION_DATA_DIR 'logs') -File | Select-String 'external_url_opened').Count
     if ($after -le $before) { throw "Native browser opener did not report success: $Name" }
-    $script:root.SetFocus()
+    [AuditMouse]::SetForegroundWindow($app.MainWindowHandle) | Out-Null
 }
 function Check([string]$Name, [scriptblock]$Action, [string]$Expected = '') {
     try {
@@ -165,6 +166,10 @@ try {
         $app.Refresh()
         if ($app.HasExited) { throw "App exited during startup" }
     } until (($app.MainWindowHandle -ne 0 -and $app.MainWindowTitle -eq '融光 · AI 视频创作工作台') -or [DateTime]::UtcNow -gt $deadline)
+    # The runner desktop can be smaller than the default 1440x900 window.
+    # Maximize before clicking so controls cannot sit behind the taskbar.
+    [AuditMouse]::ShowWindow($app.MainWindowHandle, 3) | Out-Null
+    Start-Sleep -Milliseconds 700
     $port = (Get-Content (Join-Path $env:FUSION_DATA_DIR 'runtime-port') -Raw).Trim()
     $origin = "http://127.0.0.1:$port"
     Check 'initial' {} '最近项目'
@@ -207,7 +212,7 @@ try {
     Check 'global-assets'  { Click-Control '资产' 'header' } '素材资产'
     Check 'image-workbench' { Click-Control '工具' 'header' } '生图'
     Check 'video-workbench' { Click-Control '生视频' 'sidebar' } '生视频'
-    Check 'settings' { Click-Control '系统设置' 'header' } '个人信息'
+    Check 'settings' { Click-Control '系统设置' 'header' } '管理系统全局参数'
     $settingsPages = [ordered]@{
         '通用设置' = '管理系统全局参数'
         '用户列表' = '用户总数'

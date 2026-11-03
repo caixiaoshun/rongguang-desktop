@@ -1,6 +1,6 @@
 # Windows 桌面交互回归
 
-`desktop/scripts/explore-windows.ps1` 安装真实 NSIS 安装包，通过 Windows UI Automation 查找按钮并执行点击、键盘输入和滚动。测试使用独立的临时 `FUSION_DATA_DIR`，不读取或修改用户数据，也不配置或调用付费模型。
+`desktop/scripts/explore-windows.ps1` 安装真实 NSIS 安装包，通过 Windows UI Automation 查找按钮并执行点击、键盘输入和滚动。测试先最大化窗口，避免默认窗口超出测试机屏幕、鼠标误点任务栏。测试使用独立的临时 `FUSION_DATA_DIR`，不读取或修改用户数据，也不配置或调用付费模型。
 
 ## 已复现的问题
 
@@ -8,7 +8,7 @@
 
 | 操作 | 原行为 | 修复 |
 | --- | --- | --- |
-| 点击 GitHub | `Command plugin:shell\|open not allowed by ACL` | 桌面外链统一调用 `open_url`，交给系统浏览器；修正目标仓库地址 |
+| 点击 GitHub | `Command plugin:shell\|open not allowed by ACL` | 桌面外链统一调用 `open_url`，交给系统浏览器；为当次后端端口的确切 loopback 来源授予四个应用命令权限；修正目标仓库地址 |
 | 打开助手 | `Cannot read properties of undefined (reading 'map')` | 后端提供 `skills` / `mcpTools` 数组；前端兼容旧响应 |
 | 读取会话历史或任务中心 | 前端需要 `{list,total}`，后端返回数组 | 统一分页响应、参数和分类筛选；保留无分类的旧助手历史 |
 | 托盘打开数据目录 | 使用 Tauri identifier 目录，与 SQLite / 媒体目录不同 | 使用后端实际解析的数据目录，包括环境变量覆盖 |
