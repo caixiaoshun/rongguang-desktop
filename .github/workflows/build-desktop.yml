@@ -1,0 +1,343 @@
+name: Build Desktop
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "构建完成后发布到 Gitee Release"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            label: linux-x64
+            platform: linux-x86_64
+            # 不出 AppImage：Tauri 打出来的约 130MB，超过 Gitee 单附件 100MB 上限，
+            # 且 AppImage 是 squashfs 已压缩，再 zip 也降不下来。deb + 绿色版够用。
+            bundles: '["deb"]'
+            ffmpeg_suffix: ""
+          - os: windows-latest
+            label: windows-x64
+            platform: windows-x86_64
+            bundles: '["nsis"]'
+            ffmpeg_suffix: ".exe"
+          - os: macos-14
+            label: macos-arm64
+            platform: darwin-arm64
+            bundles: '["dmg"]'
+            ffmpeg_suffix: ""
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 必须与 web/package.json 的 packageManager 一致：pnpm 9 与 10 对
+      # workspace 配置（pnpm-workspace.yaml 无 packages 字段）的解析行为不同，
+      # 9 会直接报 "packages field missing or empty"。
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+          run_install: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 Rust
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: desktop
+
+      - name: 安装 Linux 系统依赖
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf libssl-dev
+
+      # ---------- 前端 ----------
+      # FUSION_DESKTOP_BUILD=1 是静态导出的开关，缺了它 next.config.ts 会走
+      # standalone 输出（产物在 .next/ 而非 out/），Tauri 打包时找不到前端。
+      - name: 构建前端（静态导出）
+        working-directory: web
+        env:
+          FUSION_DESKTOP_BUILD: "1"
+          NODE_ENV: production
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: 校验前端产物
+        shell: bash
+        run: |
+          test -f web/out/index.html || (echo "前端产物缺失" && ls -la web && exit 1)
+          echo "前端产物大小: $(du -sh web/out | cut -f1)"
+
+
+
+      # 可复现性检查：仓库公开、装包也公开分发，产物里绝不能带任何 API Key。
+      # 编译期注入通道已移除，这里再兜底扫一遍源码。
+      - name: 校验产物不含密钥
+        shell: bash
+        run: |
+          set -e
+          echo "扫描源码中的密钥特征..."
+          if grep -rnE "g2a_[A-Za-z0-9_-]{10,}|ghp_[A-Za-z0-9]{20,}" \
+               --include="*.rs" --include="*.ts" --include="*.tsx" \
+               --include="*.json" --include="*.toml" \
+               desktop/crates web/app web/lib 2>/dev/null; then
+            echo "::error::源码中发现疑似密钥"
+            exit 1
+          fi
+          echo "源码干净"
+
+      # 曾经 AppConfig 默认值里写死了维护者的中转站域名，编进二进制后 strings 直接可见。
+      # 这条 grep 只针对那一行，不会误报，也不用来回维护域名白名单。
+      - name: 校验默认配置不含预置地址
+        shell: bash
+        run: |
+          set -e
+          if grep -nE 'grok_base_url:\s*"[^"]*://' desktop/crates/core/src/config.rs; then
+            echo "::error::config.rs 里 grok_base_url 的默认值不能是具体地址"
+            exit 1
+          fi
+          echo "默认配置未预置任何服务地址"
+
+      # 单元测试里有防回归断言，见 crates/core/src/config.rs 的 tests 模块
+      # 只跑一次：断言是纯逻辑，与平台无关
+      - name: 运行后端测试
+        if: matrix.os == 'ubuntu-22.04'
+        working-directory: desktop
+        run: cargo test -p fusion-core --lib
+
+      # ---------- 随包 ffmpeg ----------
+      # 必须静态构建：动态版换机器会因缺 .so/.dll 直接崩。
+      # 用 ffmpeg-static / ffprobe-static 这两个 npm 包，各平台都有对应预编译静态二进制。
+      - name: 准备静态 ffmpeg
+        shell: bash
+        run: |
+          set -e
+          mkdir -p /tmp/ffdl && cd /tmp/ffdl
+          npm init -y >/dev/null 2>&1
+          npm install --no-audit --no-fund ffmpeg-static ffprobe-static
+          FF=$(node -e "process.stdout.write(require('ffmpeg-static'))")
+          FP=$(node -e "process.stdout.write(require('ffprobe-static').path)")
+          echo "ffmpeg:  $FF"
+          echo "ffprobe: $FP"
+          test -f "$FF" || (echo "ffmpeg-static 未提供二进制" && exit 1)
+          test -f "$FP" || (echo "ffprobe-static 未提供二进制" && exit 1)
+          DEST="$GITHUB_WORKSPACE/desktop/vendor/ffmpeg/current"
+          mkdir -p "$DEST"
+          cp "$FF" "$DEST/ffmpeg${{ matrix.ffmpeg_suffix }}"
+          cp "$FP" "$DEST/ffprobe${{ matrix.ffmpeg_suffix }}"
+          chmod +x "$DEST"/* || true
+          ls -lh "$DEST"
+          "$DEST/ffmpeg${{ matrix.ffmpeg_suffix }}" -version | head -1
+
+      - name: 安装 Tauri CLI
+        run: npm install -g @tauri-apps/cli@^2
+
+      # ---------- 构建并打包 ----------
+      - name: 构建桌面安装包
+        shell: bash
+        working-directory: desktop
+        env:
+          # targets 用环境变量传 JSON，避免把 ["dmg","app"] 内联进 node -e 的双引号脚本里
+          # （内层双引号会提前闭合字符串，导致 "dmg is not defined"）。
+          BUNDLE_TARGETS: ${{ matrix.bundles }}
+          FFMPEG_SUFFIX: ${{ matrix.ffmpeg_suffix }}
+        run: |
+          set -e
+          SUFFIX="$FFMPEG_SUFFIX"
+          # resources 的键是相对 src-tauri/ 的路径，值是包内落点。
+          # 落点 bin/ 与桌面壳 locate_bundled_ffmpeg 的查找路径一一对应。
+          CONFIG=$(node -e "
+            const suffix = process.env.FFMPEG_SUFFIX;
+            const targets = JSON.parse(process.env.BUNDLE_TARGETS);
+            console.log(JSON.stringify({
+              bundle: {
+                targets,
+                resources: {
+                  '../../web/out/': 'web/',
+                  ['../vendor/ffmpeg/current/ffmpeg' + suffix]: 'bin/ffmpeg' + suffix,
+                  ['../vendor/ffmpeg/current/ffprobe' + suffix]: 'bin/ffprobe' + suffix
+                }
+              }
+            }));
+          ")
+          echo "config=$CONFIG"
+          tauri build --config "$CONFIG"
+
+      - name: 收集产物
+        shell: bash
+        run: |
+          set -e
+          # Tauri 输出在 desktop/target/release/（src-tauri/target 只是本地软链 alias，CI 里不存在）
+          TARGET="desktop/target/release"
+          echo "产物目录: $TARGET"
+          mkdir -p artifacts
+          # 每个平台只出一个安装包，不做绿色版
+          find "$TARGET/bundle" -type f \
+            \( -name "*.exe" -o -name "*.dmg" -o -name "*.deb" \) \
+            -exec cp {} artifacts/ \;
+          echo "=== 产物清单 ==="
+          ls -lh artifacts
+          # 恰好一个安装包，多一个少一个都说明配置不对
+          # BSD wc 会输出前导空格，用算术比较而不是字符串比较
+          COUNT=$(find artifacts -type f | wc -l)
+          [ "$COUNT" -eq 1 ] || (echo "::error::期望 1 个产物，实际 ${COUNT} 个" && exit 1)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rongguang-${{ matrix.label }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 14
+  # 汇总所有平台产物并发布到 GitHub Release
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish)
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 整理产物
+        run: |
+          mkdir -p out
+          find dist -type f \( -name "*.exe" -o -name "*.dmg" -o -name "*.deb" \) -exec cp {} out/ \;
+          echo "=== 待发布 $(ls out | wc -l) 个文件 ==="
+          ls -lh out
+
+      - name: 确定版本号
+        id: ver
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            # 从 tauri.conf.json 推导，保证与安装包文件名里的版本号一致。
+            # 不能用 GITHUB_REF_NAME：workflow_dispatch 触发时它是分支名 main。
+            VERSION=$(node -p "require('./desktop/src-tauri/tauri.conf.json').version")
+            TAG="v${VERSION}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "版本号: $TAG"
+
+      - name: 发布到 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: 融光 ${{ steps.ver.outputs.tag }}
+          body: |
+            自动构建产物（Windows / Linux / macOS Apple Silicon）
+
+            - **Windows**：`RongGuang_<版本>_x64-setup.exe`（NSIS 安装包）
+            - **Linux**：`RongGuang_<版本>_amd64.deb`
+            - **macOS**：`RongGuang_<版本>_aarch64.dmg`（Apple Silicon）
+
+            内置 ffmpeg，首次启动即可用，无需额外配置。
+
+            > ⚠️ 安装包**不内置 API Key，也不预置任何服务地址**。首次启动请到「设置 → AI 模型」
+            > 里把服务地址和 Key 都填上（两项都填好才能保存）。
+
+            > macOS 仅 arm64，Intel 机器需自行从源码构建。
+          files: out/*
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false
+
+      # Gitee 作为国内下载镜像，只建 release 并写说明，**不上传附件**。
+      #
+      # 为什么不在 CI 里传包：实测 GitHub runner 到 Gitee 单连接约 0.2MB/s，
+      # 43+61+52MB 三个包即使 3 路并发，1 小时也传不完（一次实跑卡死 45 分钟后
+      # 被手工取消）。附件改由维护者机器补传，那里到 Gitee 有 6MB/s 以上。
+      # 附带好处：release 容器先建好，补传时不用再处理「tag 不存在」的分支。
+      - name: 创建 Gitee Release（国内镜像）
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITEE_OWNER: caixiaoshun
+          GITEE_REPO: ai-fusion-video
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          set -euo pipefail
+          API="https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}"
+
+          BODY=$(cat <<'EOF'
+          自动构建产物（Windows / Linux / macOS Apple Silicon）
+
+          - Windows：RongGuang_<版本>_x64-setup.exe（NSIS 安装包）
+          - Linux：RongGuang_<版本>_amd64.deb
+          - macOS：RongGuang_<版本>_aarch64.dmg（Apple Silicon）
+
+          安装包不内置 API Key，也不预置任何服务地址：首次启动请到「设置 → AI 模型」里把服务地址和 Key 都填上。
+
+          > macOS 仅 arm64，Intel 机器需自行从源码构建。
+          EOF
+          )
+          export BODY
+
+          PAYLOAD=$(node -e '
+            console.log(JSON.stringify({
+              access_token: process.env.GITEE_TOKEN,
+              tag_name: process.env.TAG,
+              name: "融光 " + process.env.TAG,
+              body: process.env.BODY,
+              target_commitish: "main"
+            }));
+          ')
+
+          # Gitee 对不存在的 tag 返回 HTTP 200 + body "null"（不是 404），
+          # 只能靠能不能取到 id 来区分。
+          RESP=$(curl -sS -w '\n%{http_code}' \
+            "${API}/releases/tags/${TAG}?access_token=${GITEE_TOKEN}" || true)
+          BODYJSON=$(printf '%s' "$RESP" | sed '$d')
+          REL_ID=$(printf '%s' "$BODYJSON" | python3 -c "
+          import sys, json
+          try:
+              d = json.load(sys.stdin)
+          except Exception:
+              d = None
+          print(d.get('id', '') if isinstance(d, dict) else '')
+          " 2>/dev/null || true)
+
+          if [ -n "$REL_ID" ]; then
+            echo "更新已有 Gitee release id=$REL_ID"
+            curl -sS -o /dev/null -X PATCH "${API}/releases/${REL_ID}" \
+              -H "Content-Type: application/json" -d "$PAYLOAD"
+          else
+            echo "创建 Gitee release"
+            curl -sS -o /tmp/gitee_rel.json -X POST "${API}/releases" \
+              -H "Content-Type: application/json" -d "$PAYLOAD"
+            REL_ID=$(python3 -c "import json;print(json.load(open('/tmp/gitee_rel.json'))['id'])")
+          fi
+          echo "gitee release id=$REL_ID" >> "$GITHUB_STEP_SUMMARY"
+          echo "Gitee Release 已创建，附件由维护者本机补传（CI 链路传不动）。"
+          echo "Gitee 镜像发布完成: https://gitee.com/${GITEE_OWNER}/${GITEE_REPO}/releases/tag/${TAG}"
+          echo "Gitee release: https://gitee.com/${GITEE_OWNER}/${GITEE_REPO}/releases/tag/${TAG}" >> "$GITHUB_STEP_SUMMARY"

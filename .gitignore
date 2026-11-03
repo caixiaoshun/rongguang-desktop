@@ -1,0 +1,30 @@
+# ---- 构建产物 ----
+/desktop/target/
+/desktop/src-tauri/target/
+/desktop/dist/
+/desktop/src-tauri/gen/
+/desktop/vendor/ffmpeg/**/ffmpeg
+/desktop/vendor/ffmpeg/**/ffprobe
+/desktop/vendor/ffmpeg/**/*.exe
+
+# ---- 前端 ----
+/web/node_modules/
+/web/.next/
+/web/out/
+/web/tsconfig.tsbuildinfo
+/web/.env*.local
+
+# ---- 运行时数据 ----
+/data/
+/logs/
+*.log
+*.pid
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# ---- 本地密钥（禁止提交）----
+/desktop/.cargo/config.toml
