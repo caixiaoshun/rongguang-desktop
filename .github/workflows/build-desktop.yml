@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       publish:
-        description: "构建完成后发布到 Gitee Release"
+        description: "验证通过后发布 GitHub Release，并创建 Gitee Release 容器"
         type: boolean
         default: true
 
@@ -158,6 +158,10 @@ jobs:
       - name: 安装 Tauri CLI
         run: npm install -g @tauri-apps/cli@^2
 
+      - name: 测试桌面启动状态与错误页面
+        working-directory: desktop
+        run: cargo test --release --locked -p rongguang --lib --features custom-protocol
+
       # ---------- 构建并打包 ----------
       - name: 构建桌面安装包
         shell: bash
@@ -208,6 +212,21 @@ jobs:
           COUNT=$(find artifacts -type f | wc -l)
           [ "$COUNT" -eq 1 ] || (echo "::error::期望 1 个产物，实际 ${COUNT} 个" && exit 1)
 
+      - name: Windows 安装包启动与无响应回归检查
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $installer = (Get-ChildItem artifacts -Filter '*-setup.exe' | Select-Object -First 1).FullName
+          ./desktop/scripts/smoke-windows.ps1 -Installer $installer
+
+      - name: 保存 Windows 启动诊断
+        if: always() && matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-startup-logs
+          path: ${{ runner.temp }}/rongguang-smoke/**/logs/*
+          if-no-files-found: ignore
+
       - uses: actions/upload-artifact@v4
         with:
           name: rongguang-${{ matrix.label }}
@@ -257,6 +276,8 @@ jobs:
           name: 融光 ${{ steps.ver.outputs.tag }}
           body: |
             自动构建产物（Windows / Linux / macOS Apple Silicon）
+
+            更新说明：[CHANGELOG](https://github.com/caixiaoshun/rongguang-desktop/blob/${{ steps.ver.outputs.tag }}/CHANGELOG.md)
 
             - **Windows**：`RongGuang_<版本>_x64-setup.exe`（NSIS 安装包）
             - **Linux**：`RongGuang_<版本>_amd64.deb`

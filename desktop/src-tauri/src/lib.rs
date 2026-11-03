@@ -10,32 +10,32 @@ use std::sync::Arc;
 
 use fusion_core::config::AppConfig;
 use fusion_core::paths::AppPaths;
-use tauri::{Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
+use tauri::Manager;
 use tokio::sync::Mutex;
 
 /// 启动门闩：页面在窗口 ready 之前就调用 `backend_ready`，需要等一会儿。
 #[derive(Default)]
 pub struct BootState {
-    port: Arc<Mutex<Option<u16>>>,
+    port: Arc<Mutex<Option<Result<u16, String>>>>,
     ready: Arc<tokio::sync::Notify>,
 }
 
 impl BootState {
-    pub async fn wait(&self) -> u16 {
+    pub async fn wait(&self) -> Result<u16, String> {
         loop {
             // 先注册等待者再检查端口，避免「检查完→进入 await」之间丢通知。
             let waiter = self.ready.notified();
             tokio::pin!(waiter);
             waiter.as_mut().enable();
-            if let Some(port) = *self.port.lock().await {
-                return port;
+            if let Some(result) = self.port.lock().await.clone() {
+                return result;
             }
             waiter.await;
         }
     }
 
-    pub async fn set(&self, port: u16) {
-        *self.port.lock().await = Some(port);
+    pub async fn set(&self, result: Result<u16, String>) {
+        *self.port.lock().await = Some(result);
         self.ready.notify_waiters();
     }
 }
@@ -60,6 +60,20 @@ fn init_tracing(data_dir: &std::path::Path) {
 
 pub fn run() {
     let builder = tauri::Builder::default()
+        .on_page_load(|window, payload| {
+            if payload.event() == tauri::webview::PageLoadEvent::Finished
+                && payload.url().scheme() == "data"
+            {
+                tracing::warn!("启动错误页面加载完成");
+            }
+            if payload.event() == tauri::webview::PageLoadEvent::Finished
+                && payload.url().host_str() == Some("127.0.0.1")
+                && payload.url().path() == "/dashboard/"
+            {
+                tracing::info!("主界面加载完成: {}", payload.url());
+                let _ = window.set_title("融光 · AI 视频创作工作台");
+            }
+        })
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             if let Some(win) = app.get_webview_window("main") {
                 let _ = win.unminimize();
@@ -81,14 +95,23 @@ pub fn run() {
     let app = builder
         .setup(|app| {
             let handle = app.handle().clone();
+            // setup 必须立即返回，让 Windows 消息循环继续处理窗口/菜单创建。
+            // 不得在这里 block_on 后台任务，或 join 等待需要主线程的托盘线程。
             tauri::async_runtime::spawn(async move {
-                match boot_backend(&handle).await {
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(60),
+                    boot_backend(&handle),
+                )
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("本地服务启动超时（60 秒），请检查数据目录和日志")));
+                match result {
                     Ok(port) => {
-                        handle.state::<BootState>().set(port).await;
+                        handle.state::<BootState>().set(Ok(port)).await;
                         let ui_handle = handle.clone();
                         if let Err(err) = handle.run_on_main_thread(move || {
                             if let Err(err) = open_main_window(&ui_handle, port) {
                                 tracing::error!("打开主窗口失败: {err:#}");
+                                show_fatal(&ui_handle, &format!("打开主窗口失败: {err:#}"));
                             }
                             // 托盘依赖系统 appindicator，Linux 精简桌面可能缺失；
                             // 失败只降级为「无托盘」，不能拖垮主窗口。
@@ -102,6 +125,7 @@ pub fn run() {
                     Err(err) => {
                         tracing::error!("本地服务启动失败: {err:#}");
                         let message = format!("{err:#}");
+                        handle.state::<BootState>().set(Err(message.clone())).await;
                         let ui_handle = handle.clone();
                         let _ = handle.run_on_main_thread(move || {
                             show_fatal(&ui_handle, &message);
@@ -114,12 +138,7 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("融光桌面端初始化失败");
 
-    app.run(|app_handle, event| {
-        // 关窗即退出（Windows 用户直觉），托盘"退出"也走这里。
-        if let RunEvent::ExitRequested { .. } = event {
-            let _ = app_handle;
-        }
-    });
+    app.run(|_, _| {});
 }
 
 async fn boot_backend(handle: &tauri::AppHandle) -> anyhow::Result<u16> {
@@ -131,6 +150,11 @@ async fn boot_backend(handle: &tauri::AppHandle) -> anyhow::Result<u16> {
     init_tracing(&root);
     tracing::info!("数据目录: {}", root.display());
     tracing::info!("前端资源: {}", resolved.web_dir.display());
+    anyhow::ensure!(
+        resolved.web_dir.join("dashboard").join("index.html").is_file(),
+        "前端资源缺失: {}，请重新安装融光",
+        resolved.web_dir.display()
+    );
 
     let mut config = AppConfig::load(&resolved.root)?;
 
@@ -201,30 +225,43 @@ fn open_main_window(handle: &tauri::AppHandle, port: u16) -> anyhow::Result<()> 
     let url = format!("http://127.0.0.1:{port}/dashboard/");
     let parsed: tauri::Url = url.parse()?;
 
-    if let Some(win) = handle.get_webview_window("main") {
-        let _ = win.navigate(parsed);
-        let _ = win.show();
-        let _ = win.set_focus();
-        return Ok(());
-    }
-
-    WebviewWindowBuilder::new(handle, "main", WebviewUrl::External(parsed))
-        .title("融光 · AI 视频创作工作台")
-        .inner_size(1440.0, 900.0)
-        .min_inner_size(1100.0, 700.0)
-        .center()
-        .resizable(true)
-        .visible(true)
-        .build()?;
+    // 主窗口已由配置创建。不要在主线程事件回调中再创建 WebView2 窗口。
+    let win = handle.get_webview_window("main")
+        .ok_or_else(|| anyhow::anyhow!("主窗口不存在"))?;
+    win.navigate(parsed)?;
+    win.show()?;
+    win.set_focus()?;
     Ok(())
 }
 
 fn show_fatal(handle: &tauri::AppHandle, message: &str) {
+    if let Some(win) = handle.get_webview_window("main") {
+        let _ = win.set_title("融光未能启动");
+        if let Ok(url) = startup_error_url(message) {
+            if let Err(err) = win.navigate(url) {
+                tracing::error!("显示启动错误失败: {err}");
+            }
+        }
+        let _ = win.show();
+        let _ = win.set_focus();
+    }
+}
+
+fn startup_error_url(message: &str) -> anyhow::Result<tauri::Url> {
+    let html = startup_error_html(message);
+    // 即使数据目录不可写，也能显示错误；不依赖额外文件或网络。
+    let encoded: String = html.bytes().map(|b| format!("%{b:02X}")).collect();
+    Ok(tauri::Url::parse(&format!("data:text/html;charset=utf-8,{encoded}"))?)
+}
+
+fn startup_error_html(message: &str) -> String {
     let escaped = message
-        .replace('\\', "\\\\")
-        .replace('`', "\\`")
-        .replace('$', "\\$");
-    let html = format!(
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;");
+    format!(
         r#"<!doctype html><meta charset="utf-8"><style>
         html,body{{height:100%;margin:0;background:#0b0b0f;color:#e8e8ef;
         font:14px/1.7 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
@@ -237,16 +274,47 @@ fn show_fatal(handle: &tauri::AppHandle, message: &str) {
         <div class="box"><h1>融光未能启动</h1>
         <p>本地服务初始化失败，请查看下方信息，或到数据目录的 logs/ 中查找完整日志。</p>
         <pre>{escaped}</pre></div>"#
-    );
+    )
+}
 
-    if let Ok(dir) = handle.path().app_data_dir() {
-        let file = dir.join("startup-error.html");
-        let _ = std::fs::write(&file, &html);
-        if let Ok(u) = tauri::Url::from_file_path(&file) {
-            if let Some(win) = handle.get_webview_window("main") {
-                let _ = win.navigate(u);
-                let _ = win.show();
-            }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn startup_result_wakes_all_waiters_and_remains_available() {
+        let state = Arc::new(BootState::default());
+        let mut waiters = Vec::new();
+        for _ in 0..8 {
+            let state = state.clone();
+            waiters.push(tokio::spawn(async move { state.wait().await }));
         }
+        tokio::task::yield_now().await;
+        state.set(Ok(12345)).await;
+        for waiter in waiters {
+            assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(1), waiter).await.unwrap().unwrap(), Ok(12345));
+        }
+        assert_eq!(state.wait().await, Ok(12345));
+    }
+
+    #[tokio::test]
+    async fn startup_failure_reaches_pending_and_late_callers() {
+        let state = Arc::new(BootState::default());
+        let pending = state.clone();
+        let waiter = tokio::spawn(async move { pending.wait().await });
+        tokio::task::yield_now().await;
+        state.set(Err("端口被占用".into())).await;
+        assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(1), waiter).await.unwrap().unwrap(), Err("端口被占用".into()));
+        assert_eq!(state.wait().await, Err("端口被占用".into()));
+    }
+
+    #[test]
+    fn error_page_escapes_messages_and_needs_no_filesystem() {
+        let html = startup_error_html("目录 <script>alert('x')</script> & \"路径\" # %");
+        assert!(html.contains("目录 &lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt; &amp; &quot;路径&quot; # %"));
+        assert!(!html.contains("<script>"));
+        let url = startup_error_url("C:\\用户\\数据 # %\n拒绝访问").unwrap();
+        assert_eq!(url.scheme(), "data");
+        assert!(url.fragment().is_none());
     }
 }

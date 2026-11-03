@@ -1,4 +1,4 @@
-//! 系统托盘：常驻入口，关闭窗口不影响托盘存在。
+//! 系统托盘：显示主窗口、打开数据目录与退出。
 
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};

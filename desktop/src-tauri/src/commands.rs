@@ -24,7 +24,7 @@ pub struct BackendReady {
 /// 页面启动时调用：返回本地服务端口，前端据此拼出绝对地址（下载、预览等场景）。
 #[tauri::command]
 pub async fn backend_ready(state: State<'_, BootState>) -> Result<BackendReady, String> {
-    let port = state.wait().await;
+    let port = state.wait().await?;
     Ok(BackendReady {
         port,
         origin: format!("http://127.0.0.1:{port}"),
@@ -33,7 +33,7 @@ pub async fn backend_ready(state: State<'_, BootState>) -> Result<BackendReady, 
 
 #[tauri::command]
 pub async fn app_info(app: AppHandle, state: State<'_, BootState>) -> Result<AppInfo, String> {
-    let port = state.wait().await;
+    let port = state.wait().await?;
     let data_dir = app
         .path()
         .app_data_dir()
