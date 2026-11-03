@@ -76,7 +76,7 @@ test("route disposal cancels pending refreshes", async () => {
 });
 
 const dataSource = await readFile(new URL(
-  "../app/(dashboard)/projects/[id]/storyboards/storyboard-data.ts", import.meta.url,
+  "../app/(dashboard)/projects/detail/storyboards/storyboard-data.ts", import.meta.url,
 ), "utf8");
 const dataModule = ts.transpileModule(dataSource, {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2020 },

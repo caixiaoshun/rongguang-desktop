@@ -71,7 +71,7 @@ pub fn run() {
                 && payload.url().path() == "/dashboard/"
             {
                 tracing::info!("主界面加载完成: {}", payload.url());
-                let _ = window.set_title("融光 · AI 视频创作工作台");
+                let _ = window.window().set_title("融光 · AI 视频创作工作台");
             }
         })
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {

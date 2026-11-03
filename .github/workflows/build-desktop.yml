@@ -94,6 +94,11 @@ jobs:
           test -f web/out/index.html || (echo "前端产物缺失" && ls -la web && exit 1)
           echo "前端产物大小: $(du -sh web/out | cut -f1)"
 
+      - name: 前端分镜刷新回归测试
+        if: matrix.os == 'ubuntu-22.04'
+        working-directory: web
+        run: pnpm test:storyboard
+
 
 
       # 可复现性检查：仓库公开、装包也公开分发，产物里绝不能带任何 API Key。
@@ -273,6 +278,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           name: 融光 ${{ steps.ver.outputs.tag }}
           body: |
             自动构建产物（Windows / Linux / macOS Apple Silicon）
