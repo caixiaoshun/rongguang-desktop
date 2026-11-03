@@ -81,25 +81,35 @@ pub fn run() {
     let app = builder
         .setup(|app| {
             let handle = app.handle().clone();
-            tauri::async_runtime::block_on(async move {
+            tauri::async_runtime::spawn(async move {
                 match boot_backend(&handle).await {
                     Ok(port) => {
                         handle.state::<BootState>().set(port).await;
-                        open_main_window(&handle, port)?;
-                        // 托盘依赖系统 appindicator，Linux 精简桌面可能缺失；
-                        // 失败只降级为「无托盘」，不能拖垮主窗口。
-                        if let Err(err) = tray::install(&handle) {
-                            tracing::warn!("系统托盘不可用: {err}");
+                        let ui_handle = handle.clone();
+                        if let Err(err) = handle.run_on_main_thread(move || {
+                            if let Err(err) = open_main_window(&ui_handle, port) {
+                                tracing::error!("打开主窗口失败: {err:#}");
+                            }
+                            // 托盘依赖系统 appindicator，Linux 精简桌面可能缺失；
+                            // 失败只降级为「无托盘」，不能拖垮主窗口。
+                            if let Err(err) = tray::install(&ui_handle) {
+                                tracing::warn!("系统托盘不可用: {err}");
+                            }
+                        }) {
+                            tracing::error!("调度主线程 UI 初始化失败: {err:#}");
                         }
-                        Ok(())
                     }
                     Err(err) => {
                         tracing::error!("本地服务启动失败: {err:#}");
-                        show_fatal(&handle, &format!("{err:#}"));
-                        Err(Box::<dyn std::error::Error>::from(err.to_string()))
+                        let message = format!("{err:#}");
+                        let ui_handle = handle.clone();
+                        let _ = handle.run_on_main_thread(move || {
+                            show_fatal(&ui_handle, &message);
+                        });
                     }
                 }
-            })
+            });
+            Ok(())
         })
         .build(tauri::generate_context!())
         .expect("融光桌面端初始化失败");
@@ -146,7 +156,11 @@ async fn boot_backend(handle: &tauri::AppHandle) -> anyhow::Result<u16> {
 
 /// 在打包产物里定位随包 ffmpeg。找不到返回 `None`，交给后端回落 PATH。
 fn locate_bundled_ffmpeg(handle: &tauri::AppHandle) -> Option<std::path::PathBuf> {
-    let name = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
+    let name = if cfg!(windows) {
+        "ffmpeg.exe"
+    } else {
+        "ffmpeg"
+    };
 
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     if let Ok(res) = handle.path().resource_dir() {
@@ -206,7 +220,10 @@ fn open_main_window(handle: &tauri::AppHandle, port: u16) -> anyhow::Result<()> 
 }
 
 fn show_fatal(handle: &tauri::AppHandle, message: &str) {
-    let escaped = message.replace('\\', "\\\\").replace('`', "\\`").replace('$', "\\$");
+    let escaped = message
+        .replace('\\', "\\\\")
+        .replace('`', "\\`")
+        .replace('$', "\\$");
     let html = format!(
         r#"<!doctype html><meta charset="utf-8"><style>
         html,body{{height:100%;margin:0;background:#0b0b0f;color:#e8e8ef;
