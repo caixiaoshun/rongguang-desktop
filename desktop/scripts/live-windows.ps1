@@ -186,7 +186,8 @@ function Check([string]$Name, [scriptblock]$Action, [string[]]$Expected = @()) {
     $results | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $evidence 'results.json') -Encoding UTF8
 }
 function Get-Api([string]$Path) {
-    $response = Invoke-RestMethod ($origin + $Path) -TimeoutSec 35
+    $raw = Invoke-WebRequest ($origin + $Path) -UseBasicParsing -TimeoutSec 35
+    $response = [System.Text.Encoding]::UTF8.GetString($raw.RawContentStream.ToArray()) | ConvertFrom-Json
     if ($response.code -ne 0) { throw ([string]$response.msg) }
     return $response.data
 }
@@ -245,11 +246,13 @@ function Test-Generation([string]$Kind, [string]$Prompt) {
     else { Type-Control '视频提示词' $Prompt; Click-Control '生成视频' }
     Save-State "$Kind-submitted" | Out-Null
     $deadline = [DateTime]::UtcNow.AddSeconds(900)
+    $submittedDeadline = [DateTime]::UtcNow.AddSeconds(30)
     $task = $null
     do {
         $page = Get-Api "/api/generation/$Kind/page?pageNo=1&pageSize=20"
         $task = $page.list | Where-Object { $_.id -gt $lastId } | Sort-Object id -Descending | Select-Object -First 1
         if ($task -and $task.status -in @(2,3,4)) { break }
+        if (-not $task -and [DateTime]::UtcNow -gt $submittedDeadline) { throw 'UI did not create a task within 30 seconds' }
         Start-Sleep -Seconds 3
     } until ([DateTime]::UtcNow -gt $deadline)
     if (-not $task) { throw 'No generation task was created by the UI' }
