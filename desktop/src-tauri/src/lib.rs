@@ -61,10 +61,18 @@ fn init_tracing(data_dir: &std::path::Path) {
 pub fn run() {
     let builder = tauri::Builder::default()
         .on_page_load(|window, payload| {
+            // 后端可能比本地加载页更早失败；页面完成后补一次错误渲染，
+            // 防止过早 eval 的结果被初始页面加载覆盖。
             if payload.event() == tauri::webview::PageLoadEvent::Finished
-                && payload.url().scheme() == "data"
+                && payload.url().path().ends_with("/loading.html")
             {
-                tracing::warn!("启动错误页面加载完成");
+                let handle = window.app_handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(message) = handle.state::<BootState>().wait().await {
+                        let ui_handle = handle.clone();
+                        let _ = handle.run_on_main_thread(move || show_fatal(&ui_handle, &message));
+                    }
+                });
             }
             if payload.event() == tauri::webview::PageLoadEvent::Finished
                 && payload.url().host_str() == Some("127.0.0.1")
@@ -237,21 +245,17 @@ fn open_main_window(handle: &tauri::AppHandle, port: u16) -> anyhow::Result<()> 
 fn show_fatal(handle: &tauri::AppHandle, message: &str) {
     if let Some(win) = handle.get_webview_window("main") {
         let _ = win.set_title("融光未能启动");
-        if let Ok(url) = startup_error_url(message) {
-            if let Err(err) = win.navigate(url) {
-                tracing::error!("显示启动错误失败: {err}");
-            }
+        // 在当前窗口渲染，不依赖 WebView2 对 data: / file: 导航的支持。
+        let html = serde_json::to_string(&startup_error_html(message)).unwrap_or_default();
+        let script = format!(
+            "(() => {{ const render = () => {{ document.documentElement.innerHTML = {html}; document.title = '融光未能启动'; }}; if (document.readyState === 'loading') {{ document.addEventListener('DOMContentLoaded', render, {{ once: true }}); }} else {{ render(); }} }})();"
+        );
+        if let Err(err) = win.eval(script) {
+            tracing::error!("显示启动错误失败: {err}");
         }
         let _ = win.show();
         let _ = win.set_focus();
     }
-}
-
-fn startup_error_url(message: &str) -> anyhow::Result<tauri::Url> {
-    let html = startup_error_html(message);
-    // 即使数据目录不可写，也能显示错误；不依赖额外文件或网络。
-    let encoded: String = html.bytes().map(|b| format!("%{b:02X}")).collect();
-    Ok(tauri::Url::parse(&format!("data:text/html;charset=utf-8,{encoded}"))?)
 }
 
 fn startup_error_html(message: &str) -> String {
@@ -313,8 +317,6 @@ mod tests {
         let html = startup_error_html("目录 <script>alert('x')</script> & \"路径\" # %");
         assert!(html.contains("目录 &lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt; &amp; &quot;路径&quot; # %"));
         assert!(!html.contains("<script>"));
-        let url = startup_error_url("C:\\用户\\数据 # %\n拒绝访问").unwrap();
-        assert_eq!(url.scheme(), "data");
-        assert!(url.fragment().is_none());
+        assert!(startup_error_html("C:\\用户\\数据 # %\n拒绝访问").contains("C:\\用户\\数据 # %\n拒绝访问"));
     }
 }

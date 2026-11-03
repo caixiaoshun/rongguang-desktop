@@ -43,9 +43,15 @@ function Stop-App([System.Diagnostics.Process]$App) {
 $oldDataDir = $env:FUSION_DATA_DIR
 $oldPort = $env:FUSION_PORT
 $oldWebDir = $env:FUSION_WEB_DIR
+$oldBrowserArgs = $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS
 $app = $null
 $listener = $null
 try {
+    $debugListener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+    $debugListener.Start()
+    $debugPort = $debugListener.LocalEndpoint.Port
+    $debugListener.Stop()
+    $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = "--remote-debugging-port=$debugPort"
     # Exercise the installed resources, not the source checkout's web/out.
     $env:FUSION_WEB_DIR = Join-Path $installDir "web"
     $env:FUSION_PORT = "0"
@@ -64,6 +70,8 @@ try {
         if ($page.StatusCode -ne 200 -or $page.Content -notmatch "_next/") { throw "Dashboard resources missing" }
         if (-not (Test-Path (Join-Path $env:FUSION_DATA_DIR "fusion.db"))) { throw "SQLite database missing" }
         if ((Read-AppLog $env:FUSION_DATA_DIR) -notmatch "主界面加载完成") { throw "WebView did not finish loading the dashboard" }
+        node (Join-Path $PSScriptRoot "check-webview.mjs") $debugPort normal (Join-Path $OutputDir "launch-$attempt.png")
+        if ($LASTEXITCODE -ne 0) { throw "Dashboard DOM check failed" }
         # The original tray deadlock occurred after backend startup; keep probing the UI.
         foreach ($probe in 1..10) {
             Start-Sleep -Milliseconds 500
@@ -82,9 +90,10 @@ try {
     $env:FUSION_DATA_DIR = Join-Path $OutputDir "port-conflict"
     $app = Start-Process -FilePath $executable -WorkingDirectory $installDir -PassThru
     Wait-App $app {
-        $app.MainWindowTitle -eq "融光未能启动" -and
-        (Read-AppLog $env:FUSION_DATA_DIR) -match "启动错误页面加载完成"
+        $app.MainWindowTitle -eq "融光未能启动"
     }
+    node (Join-Path $PSScriptRoot "check-webview.mjs") $debugPort error (Join-Path $OutputDir "port-conflict.png")
+    if ($LASTEXITCODE -ne 0) { throw "Startup error DOM check failed" }
     Stop-App $app
     $app = $null
     Write-Host "PASS: occupied port shows a responsive error page and closes normally"
@@ -94,4 +103,5 @@ try {
     $env:FUSION_DATA_DIR = $oldDataDir
     $env:FUSION_PORT = $oldPort
     $env:FUSION_WEB_DIR = $oldWebDir
+    $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = $oldBrowserArgs
 }

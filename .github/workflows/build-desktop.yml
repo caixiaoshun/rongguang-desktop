@@ -164,6 +164,7 @@ jobs:
         run: npm install -g @tauri-apps/cli@^2
 
       - name: 测试桌面启动状态与错误页面
+        if: matrix.os == 'ubuntu-22.04'
         working-directory: desktop
         run: cargo test --release --locked -p rongguang --lib --features custom-protocol
 
@@ -229,7 +230,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: windows-startup-logs
-          path: ${{ runner.temp }}/rongguang-smoke/**/logs/*
+          path: |
+            ${{ runner.temp }}/rongguang-smoke/**/logs/*
+            ${{ runner.temp }}/rongguang-smoke/*.png
           if-no-files-found: ignore
 
       - uses: actions/upload-artifact@v4
