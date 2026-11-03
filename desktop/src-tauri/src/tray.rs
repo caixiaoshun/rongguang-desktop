@@ -6,30 +6,17 @@ use tauri::{AppHandle, Manager};
 
 /// 安装托盘。
 ///
-/// 底层 `libappindicator-sys` 在找不到动态库时是**直接 panic**，不是返回 Err，
-/// 而精简版 Linux 桌面经常不带 appindicator。因此这里放到独立线程里安装，
-/// 用 `catch_unwind` 兜住 panic：托盘失败只意味着「没有托盘图标」，主窗口照常可用。
+/// Windows 上 Tauri 会把托盘创建强制调度到主线程并等待完成，因此不能在子线程中
+/// 同步调用，否则会与阻塞的主线程形成死锁。这里由调用方保证在主线程执行。
+///
+/// 底层 `libappindicator-sys` 在找不到动态库时是**直接 panic**，不是 Err，
+/// 而精简版 Linux 桌面经常不带 appindicator，因此用 `catch_unwind` 兜住 panic：
+/// 托盘失败只意味着「没有托盘图标」，主窗口照常可用。
 pub fn install(app: &AppHandle) -> tauri::Result<()> {
-    let handle = app.clone();
-    let result = std::thread::Builder::new()
-        .name("tray-init".into())
-        .spawn(move || {
-            let h = handle.clone();
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || build_tray(&h)))
-        })
-        .and_then(|join| {
-            join.join()
-                .map_err(|_| std::io::Error::other("tray thread panicked"))
-        });
-
-    match result {
-        Ok(Ok(inner)) => inner,
-        Ok(Err(_panic)) => {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_tray(app))) {
+        Ok(result) => result,
+        Err(_panic) => {
             tracing::warn!("托盘初始化 panic（通常缺少 libayatana-appindicator3），已跳过");
-            Ok(())
-        }
-        Err(e) => {
-            tracing::warn!("托盘线程启动失败: {e}");
             Ok(())
         }
     }
