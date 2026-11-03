@@ -61,9 +61,14 @@ fn ff_tool(configured: &str, base: &str) -> String {
 pub async fn probe_version(bin: &str) -> Option<String> {
     // 随包的 ffmpeg 若损坏/缺少动态库，可能出现长时间不返回的情况；
     // 这属于「非致命」探测，绝不能把整个应用启动拖住。
+    let mut command = Command::new(bin);
+    command.kill_on_drop(true);
+    // GUI 程序探测 ffmpeg 时不弹出控制台；超时后同时回收子进程。
+    #[cfg(windows)]
+    command.creation_flags(0x08000000); // CREATE_NO_WINDOW
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(8),
-        Command::new(bin)
+        command
             .arg("-version")
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
