@@ -2,7 +2,7 @@ name: Build Desktop
 
 on:
   push:
-    branches: [fix/desktop-interactions]
+    branches: [main, fix/desktop-interactions]
     paths:
       - web/**
       - desktop/crates/**
@@ -274,7 +274,8 @@ jobs:
   # 汇总所有平台产物并发布到 GitHub Release
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish)
+    # Ordinary main commits only build; publishing requires an explicit release title.
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish) || (github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'release: v'))
     runs-on: ubuntu-22.04
     permissions:
       contents: write
