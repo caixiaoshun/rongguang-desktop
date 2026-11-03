@@ -56,6 +56,7 @@ pub fn open_url(url: String) -> Result<(), String> {
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         return Err("仅支持 http/https 链接".into());
     }
+    tracing::info!("external_url_requested");
     tauri_plugin_opener::open_url(url, None::<&str>).map_err(|e| e.to_string())?;
     tracing::info!("external_url_opened");
     Ok(())

@@ -140,10 +140,10 @@ async fn list_conversations(
     let offset = q.page_no.or(q.page).unwrap_or(1).max(1).saturating_sub(1).saturating_mul(size);
     let category = q.category.filter(|value| !value.trim().is_empty());
     let total: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM afv_agent_conversation WHERE deleted = 0 AND (? IS NULL OR category = ?)",
+        "SELECT COUNT(*) FROM afv_agent_conversation WHERE deleted = 0 AND (? IS NULL OR COALESCE(NULLIF(category, ''), 'assistant') = ?)",
     ).bind(&category).bind(&category).fetch_one(&state.db).await?;
     let rows = sqlx::query_as::<_, AgentConversation>(
-        "SELECT * FROM afv_agent_conversation WHERE deleted = 0 AND (? IS NULL OR category = ?) ORDER BY update_time DESC, id DESC LIMIT ? OFFSET ?",
+        "SELECT * FROM afv_agent_conversation WHERE deleted = 0 AND (? IS NULL OR COALESCE(NULLIF(category, ''), 'assistant') = ?) ORDER BY update_time DESC, id DESC LIMIT ? OFFSET ?",
     )
     .bind(&category).bind(&category).bind(size).bind(offset)
     .fetch_all(&state.db).await?;
@@ -217,6 +217,7 @@ pub struct ChatReq {
     pub conversation_id: Option<String>,
     pub model_id: Option<i64>,
     pub title: Option<String>,
+    pub category: Option<String>,
     pub project_id: Option<i64>,
     pub system_prompt: Option<String>,
     pub instruction: Option<String>,
@@ -305,12 +306,13 @@ async fn ensure_conversation(
         .filter(|t| !t.trim().is_empty())
         .unwrap_or_else(|| first_message.chars().take(24).collect());
     let id =     sqlx::query(
-        "INSERT INTO afv_agent_conversation (conversation_id, user_id, title, project_id, status, deleted, create_time, update_time) VALUES (?, ?, ?, ?, 'active', 0, ?, ?)",
+        "INSERT INTO afv_agent_conversation (conversation_id, user_id, title, project_id, category, status, deleted, create_time, update_time) VALUES (?, ?, ?, ?, ?, 'active', 0, ?, ?)",
     )
     .bind(&conversation_id)
     .bind(user_id)
     .bind(&title)
     .bind(req.project_id)
+    .bind(req.category.as_deref().filter(|v| !v.trim().is_empty()).unwrap_or("assistant"))
     .bind(now())
     .bind(now())
     .execute(&state.db)
@@ -757,6 +759,23 @@ mod contract_tests {
         assert_eq!(options["mcpTools"].as_array().unwrap().len(), 1);
         assert_eq!(options["mcpTools"][0]["toolName"], "search");
         assert_eq!(options["mcpTools"][0]["readOnly"], false);
+        cleanup(state).await;
+    }
+
+    #[tokio::test]
+    async fn assistant_history_preserves_legacy_and_new_conversations() {
+        let state = fixture().await;
+        sqlx::query("INSERT INTO afv_agent_conversation (conversation_id) VALUES ('legacy')")
+            .execute(&state.db).await.unwrap();
+        let (_, new_id) = ensure_conversation(&state, &ChatReq::default(), 1, "hello").await.unwrap();
+        let pipeline = ChatReq { category: Some("pipeline".into()), ..Default::default() };
+        ensure_conversation(&state, &pipeline, 1, "workflow").await.unwrap();
+        let q: ConversationQuery = serde_json::from_value(json!({"category": "assistant"})).unwrap();
+        let page = list_conversations(State(state.clone()), AuthUser::anonymous(), Query(q)).await.unwrap().0.data.unwrap();
+        assert_eq!(page["total"], 2);
+        assert_eq!(page["list"][0]["conversationId"], new_id);
+        assert_eq!(page["list"][0]["category"], "assistant");
+        assert_eq!(page["list"][1]["conversationId"], "legacy");
         cleanup(state).await;
     }
 
