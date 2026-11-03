@@ -1,7 +1,7 @@
 //! 前端可调用的命令。桌面版把「路径类操作」收拢到这里，避免网页侧直接拿到 fs 权限。
 
 use serde::Serialize;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, State};
 
 use crate::BootState;
 
@@ -34,11 +34,7 @@ pub async fn backend_ready(state: State<'_, BootState>) -> Result<BackendReady, 
 #[tauri::command]
 pub async fn app_info(app: AppHandle, state: State<'_, BootState>) -> Result<AppInfo, String> {
     let port = state.wait().await?;
-    let data_dir = app
-        .path()
-        .app_data_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
+    let data_dir = state.data_dir.get().ok_or("数据目录尚未就绪")?.display().to_string();
     Ok(AppInfo {
         version: app.package_info().version.to_string(),
         data_dir,
@@ -49,8 +45,8 @@ pub async fn app_info(app: AppHandle, state: State<'_, BootState>) -> Result<App
 
 /// 在系统文件管理器中打开数据目录，方便用户备份 SQLite 与媒体文件。
 #[tauri::command]
-pub fn open_data_dir(app: AppHandle) -> Result<(), String> {
-    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+pub fn open_data_dir(state: State<'_, BootState>) -> Result<(), String> {
+    let dir = state.data_dir.get().ok_or("数据目录尚未就绪")?;
     tauri_plugin_opener::open_path(dir, None::<&str>).map_err(|e| e.to_string())
 }
 
@@ -60,5 +56,8 @@ pub fn open_url(url: String) -> Result<(), String> {
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         return Err("仅支持 http/https 链接".into());
     }
-    tauri_plugin_opener::open_url(url, None::<&str>).map_err(|e| e.to_string())
+    tracing::info!("external_url_requested");
+    tauri_plugin_opener::open_url(url, None::<&str>).map_err(|e| e.to_string())?;
+    tracing::info!("external_url_opened");
+    Ok(())
 }

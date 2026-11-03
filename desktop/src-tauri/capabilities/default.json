@@ -1,7 +1,9 @@
 {
   "identifier": "default",
   "description": "融光桌面端默认权限",
-  "windows": ["main"],
+  "windows": [
+    "main"
+  ],
   "permissions": [
     "core:default",
     "core:window:allow-start-dragging",
@@ -11,6 +13,10 @@
     "core:webview:allow-internal-toggle-devtools",
     "shell:allow-open",
     "dialog:default",
-    "opener:default"
+    "opener:default",
+    "allow-backend-ready",
+    "allow-app-info",
+    "allow-open-data-dir",
+    "allow-open-url"
   ]
 }

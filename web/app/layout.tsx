@@ -8,6 +8,7 @@ import { ConfirmProvider } from "@/components/ui/confirm-dialog";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { GlobalClientErrorNotifier } from "@/components/global-client-error-notifier";
 import { ApplicationErrorBoundary } from "@/components/application-error-boundary";
+import { DesktopLinkHandler } from "@/components/desktop-link-handler";
 
 const inter = Inter({
   variable: "--font-inter",
@@ -53,6 +54,7 @@ export default function RootLayout({
         >
           <TooltipProvider>
             <GlobalClientErrorNotifier />
+            <DesktopLinkHandler />
             <Toaster richColors position="top-center" />
             <ConfirmProvider>
               <ApplicationErrorBoundary>

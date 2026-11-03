@@ -2,6 +2,14 @@ name: Build Desktop
 
 on:
   push:
+    branches: [fix/desktop-interactions]
+    paths:
+      - web/**
+      - desktop/crates/**
+      - desktop/src-tauri/**
+      - desktop/Cargo.toml
+      - desktop/Cargo.lock
+      - .github/workflows/build-desktop.yml
     tags: ["v*"]
   workflow_dispatch:
     inputs:
@@ -98,7 +106,9 @@ jobs:
       - name: 前端分镜刷新回归测试
         if: matrix.os == 'ubuntu-22.04'
         working-directory: web
-        run: pnpm test:storyboard
+        run: |
+          pnpm test:storyboard
+          node --test scripts/desktop-links.test.mjs
 
 
 
@@ -135,7 +145,9 @@ jobs:
       - name: 运行后端测试
         if: matrix.os == 'ubuntu-22.04'
         working-directory: desktop
-        run: cargo test -p fusion-core --lib
+        run: |
+          cargo test -p fusion-core --lib
+          cargo test -p fusion-server --lib
 
       # ---------- 随包 ffmpeg ----------
       # 必须静态构建：动态版换机器会因缺 .so/.dll 直接崩。
@@ -232,6 +244,22 @@ jobs:
         run: |
           $installer = (Get-ChildItem artifacts -Filter '*-setup.exe' | Select-Object -First 1).FullName
           ./desktop/scripts/smoke-windows.ps1 -Installer $installer
+
+      - name: Windows 按钮交互回归检查
+        timeout-minutes: 12
+        if: matrix.os == 'windows-latest'
+        shell: powershell
+        run: |
+          $installer = (Get-ChildItem artifacts -Filter '*-setup.exe' | Select-Object -First 1).FullName
+          ./desktop/scripts/explore-windows.ps1 -Installer $installer -OutputDir "$env:RUNNER_TEMP/interaction-audit"
+
+      - name: 保存 Windows 交互证据
+        if: always() && matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-interaction-evidence
+          path: ${{ runner.temp }}/interaction-audit/evidence/**
+          if-no-files-found: ignore
 
       - name: 保存 Windows 启动诊断
         if: always() && matrix.os == 'windows-latest'

@@ -16,6 +16,7 @@ use tokio::sync::Mutex;
 /// 启动门闩：页面在窗口 ready 之前就调用 `backend_ready`，需要等一会儿。
 #[derive(Default)]
 pub struct BootState {
+    data_dir: std::sync::OnceLock<std::path::PathBuf>,
     port: Arc<Mutex<Option<Result<u16, String>>>>,
     ready: Arc<tokio::sync::Notify>,
 }
@@ -155,6 +156,7 @@ async fn boot_backend(handle: &tauri::AppHandle) -> anyhow::Result<u16> {
     // 与 fusion.db / media 分家，用户「打开数据目录」时看不到日志。
     let resolved = AppPaths::resolve(resolve_web_dir(handle))?;
     let root = resolved.root.clone();
+    let _ = handle.state::<BootState>().data_dir.set(root.clone());
     init_tracing(&root);
     tracing::info!("数据目录: {}", root.display());
     tracing::info!("前端资源: {}", resolved.web_dir.display());
@@ -236,6 +238,18 @@ fn open_main_window(handle: &tauri::AppHandle, port: u16) -> anyhow::Result<()> 
     // 主窗口已由配置创建。不要在主线程事件回调中再创建 WebView2 窗口。
     let win = handle.get_webview_window("main")
         .ok_or_else(|| anyhow::anyhow!("主窗口不存在"))?;
+    // The UI is served from an ephemeral loopback port, which Tauri treats as
+    // remote content. Grant only our four app commands to this exact origin.
+    // Bundled capabilities alone do not authorize the HTTP page.
+    handle.add_capability(serde_json::json!({
+        "identifier": "backend-loopback",
+        "windows": ["main"],
+        "local": false,
+        "remote": { "urls": [format!("http://127.0.0.1:{port}/*")] },
+        "permissions": [
+            "allow-backend-ready", "allow-app-info", "allow-open-data-dir", "allow-open-url"
+        ]
+    }).to_string())?;
     win.navigate(parsed)?;
     win.show()?;
     win.set_focus()?;

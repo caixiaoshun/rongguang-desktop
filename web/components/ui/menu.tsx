@@ -119,6 +119,7 @@ export const UserAvatarDropdown = React.forwardRef<
       {/* 触发按钮：头像 + 用户名 */}
       <button
         ref={triggerRef}
+        aria-label="打开用户菜单"
         onClick={() => setIsOpen(!isOpen)}
         className={cn(
           "flex items-center gap-2 p-1.5 pr-3 rounded-xl transition-colors",

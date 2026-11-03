@@ -206,7 +206,13 @@ export interface AssistantReferenceOptions {
 }
 
 export async function getAssistantReferenceOptions(): Promise<AssistantReferenceOptions> {
-  return http.get("/api/ai/assistant/reference-options");
+  const options = await http.get<unknown, Partial<AssistantReferenceOptions>>(
+    "/api/ai/assistant/reference-options"
+  );
+  return {
+    skills: Array.isArray(options?.skills) ? options.skills : [],
+    mcpTools: Array.isArray(options?.mcpTools) ? options.mcpTools : [],
+  };
 }
 
 /**

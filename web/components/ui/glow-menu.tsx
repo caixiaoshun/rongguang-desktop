@@ -163,6 +163,7 @@ function MenuItemButton({
   return (
     <button
       onClick={() => onItemClick?.(item.label)}
+      aria-label={item.label}
       className="block w-full"
       title={iconOnly ? item.label : undefined}
     >

@@ -15,7 +15,8 @@ use fusion_ai::agent::{AgentEvent, AgentRunner};
 use fusion_ai::types::ChatMessage;
 use fusion_core::error::AppError;
 use fusion_core::models::agent::{
-    AgentConversation, AgentMessage, AssistantReferenceOptions, ReferenceOption,
+    AgentConversation, AgentMessage, AssistantReferenceOptions, AssistantSkillOption,
+    AssistantMcpToolOption, ReferenceOption,
 };
 
 use crate::auth::AuthUser;
@@ -87,7 +88,33 @@ async fn reference_options(
         })
         .collect();
 
+    let skills = super::agent_config::read_skills(&state).into_iter().map(|skill| {
+        AssistantSkillOption {
+            display_name: skill.display_name.unwrap_or_else(|| skill.name.clone()),
+            id: skill.id,
+            name: skill.name,
+            description: skill.description,
+            source: skill.source,
+        }
+    }).collect();
+    // Only explicitly enabled tools are offered; rendering the picker must not
+    // contact remote MCP servers or assume that a tool is read-only.
+    let servers = sqlx::query("SELECT name, enabled_tools_json FROM afv_agent_mcp_server WHERE deleted = 0 AND status = 1 ORDER BY id")
+        .fetch_all(&state.db).await?;
+    let mut mcp_tools = Vec::new();
+    for row in servers {
+        let server_name: String = row.get("name");
+        let enabled: Option<String> = row.get("enabled_tools_json");
+        for tool_name in crate::support::parse_string_list(&enabled) {
+            mcp_tools.push(AssistantMcpToolOption {
+                server_name: server_name.clone(), tool_name,
+                description: String::new(), read_only: false,
+            });
+        }
+    }
     ok(AssistantReferenceOptions {
+        skills,
+        mcp_tools,
         projects,
         scripts,
         assets,
@@ -99,23 +126,28 @@ async fn reference_options(
 struct ConversationQuery {
     page: Option<i64>,
     size: Option<i64>,
+    page_no: Option<i64>,
+    page_size: Option<i64>,
+    category: Option<String>,
 }
 
 async fn list_conversations(
     State(state): State<Arc<AppState>>,
     _u: AuthUser,
     Query(q): Query<ConversationQuery>,
-) -> ApiResult<Vec<AgentConversation>> {
-    let size = q.size.unwrap_or(50).clamp(1, 200);
-    let offset = ((q.page.unwrap_or(1).max(1)) - 1) * size;
+) -> ApiResult<serde_json::Value> {
+    let size = q.page_size.or(q.size).unwrap_or(50).clamp(1, 200);
+    let offset = q.page_no.or(q.page).unwrap_or(1).max(1).saturating_sub(1).saturating_mul(size);
+    let category = q.category.filter(|value| !value.trim().is_empty());
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM afv_agent_conversation WHERE deleted = 0 AND (? IS NULL OR COALESCE(NULLIF(category, ''), 'assistant') = ?)",
+    ).bind(&category).bind(&category).fetch_one(&state.db).await?;
     let rows = sqlx::query_as::<_, AgentConversation>(
-        "SELECT * FROM afv_agent_conversation WHERE deleted = 0 ORDER BY update_time DESC LIMIT ? OFFSET ?",
+        "SELECT * FROM afv_agent_conversation WHERE deleted = 0 AND (? IS NULL OR COALESCE(NULLIF(category, ''), 'assistant') = ?) ORDER BY update_time DESC, id DESC LIMIT ? OFFSET ?",
     )
-    .bind(size)
-    .bind(offset)
-    .fetch_all(&state.db)
-    .await?;
-    ok(rows)
+    .bind(&category).bind(&category).bind(size).bind(offset)
+    .fetch_all(&state.db).await?;
+    ok(json!({ "list": rows, "total": total }))
 }
 
 async fn list_messages(
@@ -185,6 +217,7 @@ pub struct ChatReq {
     pub conversation_id: Option<String>,
     pub model_id: Option<i64>,
     pub title: Option<String>,
+    pub category: Option<String>,
     pub project_id: Option<i64>,
     pub system_prompt: Option<String>,
     pub instruction: Option<String>,
@@ -273,12 +306,13 @@ async fn ensure_conversation(
         .filter(|t| !t.trim().is_empty())
         .unwrap_or_else(|| first_message.chars().take(24).collect());
     let id =     sqlx::query(
-        "INSERT INTO afv_agent_conversation (conversation_id, user_id, title, project_id, status, deleted, create_time, update_time) VALUES (?, ?, ?, ?, 'active', 0, ?, ?)",
+        "INSERT INTO afv_agent_conversation (conversation_id, user_id, title, project_id, category, status, deleted, create_time, update_time) VALUES (?, ?, ?, ?, ?, 'active', 0, ?, ?)",
     )
     .bind(&conversation_id)
     .bind(user_id)
     .bind(&title)
     .bind(req.project_id)
+    .bind(req.category.as_deref().filter(|v| !v.trim().is_empty()).unwrap_or("assistant"))
     .bind(now())
     .bind(now())
     .execute(&state.db)
@@ -683,4 +717,84 @@ async fn running_pipelines(
             })
         })
         .collect())
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    use fusion_core::{config::AppConfig, paths::AppPaths};
+
+    async fn fixture() -> Arc<AppState> {
+        let root = std::env::temp_dir().join(format!("rongguang-contract-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = AppPaths {
+            db_file: root.join("fusion.db"), media_dir: root.join("media"),
+            upload_dir: root.join("uploads"), workspace_dir: root.join("workspace"),
+            web_dir: root.join("web"), logs_dir: root.join("logs"), root,
+        };
+        Arc::new(AppState::new(paths, AppConfig::default()).await.unwrap())
+    }
+
+    async fn cleanup(state: Arc<AppState>) {
+        state.db.close().await;
+        std::fs::remove_dir_all(&state.paths.root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn references_include_empty_arrays_and_configured_metadata() {
+        let state = fixture().await;
+        let empty = reference_options(State(state.clone()), AuthUser::anonymous()).await.unwrap().0.data.unwrap();
+        let empty = serde_json::to_value(empty).unwrap();
+        assert_eq!(empty["skills"], json!([]));
+        assert_eq!(empty["mcpTools"], json!([]));
+        let skill = state.paths.root.join("agents/skills/story");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "---\ndisplayName: Story helper\ndescription: Outline a story\n---\nprivate skill instructions").unwrap();
+        sqlx::query("INSERT INTO afv_agent_mcp_server (name, enabled_tools_json) VALUES ('library', '[\"search\"]')").execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO afv_agent_mcp_server (name, enabled_tools_json, status) VALUES ('disabled', '[\"hidden\"]', 0)").execute(&state.db).await.unwrap();
+        let options = reference_options(State(state.clone()), AuthUser::anonymous()).await.unwrap().0.data.unwrap();
+        let options = serde_json::to_value(options).unwrap();
+        assert_eq!(options["skills"][0]["displayName"], "Story helper");
+        assert!(options["skills"][0].get("content").is_none());
+        assert_eq!(options["mcpTools"].as_array().unwrap().len(), 1);
+        assert_eq!(options["mcpTools"][0]["toolName"], "search");
+        assert_eq!(options["mcpTools"][0]["readOnly"], false);
+        cleanup(state).await;
+    }
+
+    #[tokio::test]
+    async fn assistant_history_preserves_legacy_and_new_conversations() {
+        let state = fixture().await;
+        sqlx::query("INSERT INTO afv_agent_conversation (conversation_id) VALUES ('legacy')")
+            .execute(&state.db).await.unwrap();
+        let (_, new_id) = ensure_conversation(&state, &ChatReq::default(), 1, "hello").await.unwrap();
+        let pipeline = ChatReq { category: Some("pipeline".into()), ..Default::default() };
+        ensure_conversation(&state, &pipeline, 1, "workflow").await.unwrap();
+        let q: ConversationQuery = serde_json::from_value(json!({"category": "assistant"})).unwrap();
+        let page = list_conversations(State(state.clone()), AuthUser::anonymous(), Query(q)).await.unwrap().0.data.unwrap();
+        assert_eq!(page["total"], 2);
+        assert_eq!(page["list"][0]["conversationId"], new_id);
+        assert_eq!(page["list"][0]["category"], "assistant");
+        assert_eq!(page["list"][1]["conversationId"], "legacy");
+        cleanup(state).await;
+    }
+
+    #[tokio::test]
+    async fn conversation_pagination_matches_frontend_and_filters_deleted_and_category() {
+        let state = fixture().await;
+        for (id, category, deleted) in [("one", "chat", 0), ("two", "chat", 0), ("other", "task", 0), ("deleted", "chat", 1)] {
+            sqlx::query("INSERT INTO afv_agent_conversation (conversation_id, category, deleted) VALUES (?, ?, ?)")
+                .bind(id).bind(category).bind(deleted).execute(&state.db).await.unwrap();
+        }
+        let q: ConversationQuery = serde_json::from_value(json!({"pageNo": 2, "pageSize": 1, "category": "chat"})).unwrap();
+        let page = list_conversations(State(state.clone()), AuthUser::anonymous(), Query(q)).await.unwrap().0.data.unwrap();
+        assert_eq!(page["total"], 2);
+        assert_eq!(page["list"].as_array().unwrap().len(), 1);
+        assert_eq!(page["list"][0]["conversationId"], "one");
+        let q: ConversationQuery = serde_json::from_value(json!({"page": 1, "size": 1})).unwrap();
+        let page = list_conversations(State(state.clone()), AuthUser::anonymous(), Query(q)).await.unwrap().0.data.unwrap();
+        assert_eq!(page["total"], 3);
+        assert_eq!(page["list"][0]["conversationId"], "other");
+        cleanup(state).await;
+    }
 }

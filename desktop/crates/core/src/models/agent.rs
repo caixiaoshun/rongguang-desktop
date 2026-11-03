@@ -95,9 +95,30 @@ pub struct UserSkill {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AssistantReferenceOptions {
+    pub skills: Vec<AssistantSkillOption>,
+    pub mcp_tools: Vec<AssistantMcpToolOption>,
     pub projects: Vec<ReferenceOption>,
     pub scripts: Vec<ReferenceOption>,
     pub assets: Vec<ReferenceOption>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssistantSkillOption {
+    pub id: String,
+    pub name: String,
+    pub display_name: String,
+    pub description: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssistantMcpToolOption {
+    pub server_name: String,
+    pub tool_name: String,
+    pub description: String,
+    pub read_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
