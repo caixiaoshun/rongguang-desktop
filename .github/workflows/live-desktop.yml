@@ -13,10 +13,11 @@ jobs:
   live:
     runs-on: windows-latest
     timeout-minutes: 90
-    env:
-      PRIVATE_DIR: ${{ runner.temp }}/live-private
-      EVIDENCE_DIR: ${{ runner.temp }}/live-evidence
     steps:
+      - name: Set private test paths
+        run: |
+          "PRIVATE_DIR=$env:RUNNER_TEMP/live-private" >> $env:GITHUB_ENV
+          "EVIDENCE_DIR=$env:RUNNER_TEMP/live-evidence" >> $env:GITHUB_ENV
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
