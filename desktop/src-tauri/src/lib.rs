@@ -16,6 +16,7 @@ use tokio::sync::Mutex;
 /// 启动门闩：页面在窗口 ready 之前就调用 `backend_ready`，需要等一会儿。
 #[derive(Default)]
 pub struct BootState {
+    data_dir: std::sync::OnceLock<std::path::PathBuf>,
     port: Arc<Mutex<Option<Result<u16, String>>>>,
     ready: Arc<tokio::sync::Notify>,
 }
@@ -155,6 +156,7 @@ async fn boot_backend(handle: &tauri::AppHandle) -> anyhow::Result<u16> {
     // 与 fusion.db / media 分家，用户「打开数据目录」时看不到日志。
     let resolved = AppPaths::resolve(resolve_web_dir(handle))?;
     let root = resolved.root.clone();
+    let _ = handle.state::<BootState>().data_dir.set(root.clone());
     init_tracing(&root);
     tracing::info!("数据目录: {}", root.display());
     tracing::info!("前端资源: {}", resolved.web_dir.display());

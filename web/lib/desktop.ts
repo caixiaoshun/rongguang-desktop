@@ -59,14 +59,15 @@ export async function openDataDir(): Promise<boolean> {
 
 /** 用系统默认浏览器打开外链；网页端退化为 window.open。 */
 export async function openExternalUrl(url: string): Promise<void> {
+  const parsed = new URL(url, window.location.href);
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    throw new Error("仅支持 http/https 链接");
+  }
   const invoke = tauriInvoke();
   if (invoke) {
-    try {
-      await invoke("open_url", { url });
-      return;
-    } catch {
-      // 落回浏览器行为
-    }
+    // 桌面端打开失败时交给调用方显示错误，不能再回退到 WebView 的新窗口。
+    await invoke("open_url", { url: parsed.href });
+    return;
   }
-  window.open(url, "_blank", "noopener,noreferrer");
+  window.open(parsed.href, "_blank", "noopener,noreferrer");
 }

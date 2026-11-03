@@ -400,7 +400,7 @@ fn parse_front_matter(text: &str) -> (BTreeMap<String, String>, String) {
     (map, body)
 }
 
-fn read_skills(state: &AppState) -> Vec<UserSkill> {
+pub(crate) fn read_skills(state: &AppState) -> Vec<UserSkill> {
     let root = skills_root(state);
     let Ok(rd) = std::fs::read_dir(&root) else {
         return Vec::new();

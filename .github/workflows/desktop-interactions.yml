@@ -10,11 +10,6 @@ on:
         description: Build Desktop run ID (empty uses the published version)
         default: ''
         type: string
-  push:
-    branches: [fix/desktop-interactions]
-    paths:
-      - .github/workflows/desktop-interactions.yml
-      - desktop/scripts/explore-windows.ps1
 permissions:
   contents: read
   actions: read

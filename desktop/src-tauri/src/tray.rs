@@ -36,8 +36,8 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         .on_menu_event(|app, event| match event.id().as_ref() {
             "show" => focus_main(app),
             "data" => {
-                if let Ok(dir) = app.path().app_data_dir() {
-                    let _ = tauri_plugin_opener::open_path(dir, None::<&str>);
+                if let Err(error) = crate::commands::open_data_dir(app.state::<crate::BootState>()) {
+                    tracing::warn!("打开数据目录失败: {error}");
                 }
             }
             "quit" => app.exit(0),

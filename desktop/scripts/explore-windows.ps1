@@ -86,9 +86,17 @@ function Click-Control([string]$Name, [string]$Region = 'any') {
 function Check([string]$Name, [scriptblock]$Action, [string]$Expected = '') {
     try {
         & $Action
+        if ($Expected) {
+            $contentDeadline = [DateTime]::UtcNow.AddSeconds(15)
+            do {
+                $currentText = Get-Text
+                if ($currentText.Contains($Expected)) { break }
+                Start-Sleep -Milliseconds 300
+            } until ([DateTime]::UtcNow -gt $contentDeadline)
+        }
         $text = Save-State $Name
         if ($Expected -and -not $text.Contains($Expected)) { throw "Expected content missing: $Expected" }
-        if ($text -match 'Application error|应用运行异常|顶部导航加载失败|侧边栏运行异常|请求失败|加载失败|发生了意外错误') { throw "UI reported an error: $($Matches[0])" }
+        if ($text -match 'Application error|运行异常|异步任务发生异常|Cannot read properties|not allowed by ACL|无法打开链接|顶部导航加载失败|请求失败|加载失败|发生了意外错误') { throw "UI reported an error: $($Matches[0])" }
         $results.Add([ordered]@{check=$Name;status='passed';evidence=$script:lastState})
         Write-Host "PASS: $Name"
     } catch {
@@ -110,7 +118,12 @@ try {
     Check 'initial' {} '最近项目'
     Check 'theme-light' { Click-Control '切换主题' }
     Check 'theme-dark' { Click-Control '切换主题' }
-    Check 'analytics' { Click-Control '数据分析' 'sidebar' } '数据分析'
+    Check 'task-center-open' { Click-Control '打开任务中心' }
+    Check 'task-center-close' { Click-Control '关闭任务中心' }
+    Check 'user-menu-open' { Click-Control '打开用户菜单' } '个人设置'
+    Check 'user-menu-settings' { Click-Control '个人设置' } '个人设置'
+    Check 'back-dashboard' { Click-Control '仪表盘' 'header' } '最近项目'
+    Check 'analytics'  { Click-Control '数据分析' 'sidebar' } '数据分析'
     Check 'dashboard' { Click-Control '总览' 'sidebar' } '最近项目'
     Check 'projects' { Click-Control '项目' 'header' } '项目管理'
     Check 'create-project-dialog' { Click-Control '新建项目' } '创建项目'
@@ -141,7 +154,17 @@ try {
     Check 'assistant-open' { Click-Control '打开融光助手' } '新对话'
     Check 'assistant-history' { Click-Control '打开会话列表' }
     Check 'assistant-history-close' { [System.Windows.Forms.SendKeys]::SendWait('{ESC}'); Start-Sleep -Milliseconds 500 }
-    Check 'github-link' { Click-Control '打开 GitHub 仓库'; Start-Sleep -Seconds 3 }
+    Check 'assistant-maximize' { Click-Control '最大化' } '恢复窗口'
+    Check 'assistant-restore' { Click-Control '恢复窗口' } '最大化'
+    Check 'assistant-close' { Click-Control '收起助手' } '打开融光助手'
+    Check 'assistant-reopen' { Click-Control '打开融光助手' } '新对话'
+    Check 'assistant-close-again' { Click-Control '收起助手' } '打开融光助手'
+    Check 'github-link' {
+        Click-Control '打开 GitHub 仓库'
+        Start-Sleep -Seconds 3
+        $opened = Get-ChildItem (Join-Path $env:FUSION_DATA_DIR 'logs') -File | Select-String 'external_url_opened'
+        if (-not $opened) { throw 'Native external browser opener did not report success' }
+    }
 } finally {
     $results | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $evidence 'results.json') -Encoding UTF8
     if (Test-Path (Join-Path $env:FUSION_DATA_DIR 'logs')) { Copy-Item (Join-Path $env:FUSION_DATA_DIR 'logs') (Join-Path $evidence 'logs') -Recurse -Force }

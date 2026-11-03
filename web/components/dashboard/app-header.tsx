@@ -222,6 +222,7 @@ export function AppHeader() {
             {/* 通知按钮 */}
             <button
               ref={bellRef}
+              aria-label={panelExpanded ? "关闭任务中心" : "打开任务中心"}
               onClick={() => {
                 if (panelExpanded) {
                   setPanelExpanded(false);
@@ -270,7 +271,7 @@ export function AppHeader() {
             </ClientErrorBoundary>
 
             <a
-              href="https://github.com/Stonewuu/ai-fusion-video"
+              href="https://github.com/caixiaoshun/rongguang-desktop"
               target="_blank"
               rel="noreferrer"
               className={cn(
