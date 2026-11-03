@@ -67,6 +67,7 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           workspaces: desktop
+          cache-on-failure: true
 
       - name: 安装 Linux 系统依赖
         if: matrix.os == 'ubuntu-22.04'
@@ -218,6 +219,13 @@ jobs:
           COUNT=$(find artifacts -type f | wc -l)
           [ "$COUNT" -eq 1 ] || (echo "::error::期望 1 个产物，实际 ${COUNT} 个" && exit 1)
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rongguang-${{ matrix.label }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Windows 安装包启动与无响应回归检查
         if: matrix.os == 'windows-latest'
         shell: pwsh
@@ -235,12 +243,6 @@ jobs:
             ${{ runner.temp }}/rongguang-smoke/*.png
           if-no-files-found: ignore
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: rongguang-${{ matrix.label }}
-          path: artifacts/*
-          if-no-files-found: error
-          retention-days: 14
   # 汇总所有平台产物并发布到 GitHub Release
   release:
     needs: build
