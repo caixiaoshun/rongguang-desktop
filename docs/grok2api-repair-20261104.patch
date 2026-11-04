@@ -1,0 +1,370 @@
+--- a/backend/internal/infra/provider/console/apikey.go
++++ b/backend/internal/infra/provider/console/apikey.go
+@@ -333,7 +333,7 @@
+ // absent or no longer belongs to the team. It is repairable, not a rate limit.
+ func isConsoleMissingAPIKeyBody(body []byte) bool {
+ 	text := strings.ToLower(string(body))
+-	return strings.Contains(text, "provision an api key") || strings.Contains(text, "not the owner")
++	return strings.Contains(text, "provision an api key") || strings.Contains(text, "not the owner") || strings.Contains(text, "incorrect api key provided")
+ }
+ 
+ func consoleOrigin(baseURL string) string {
+--- a/backend/internal/infra/provider/console/dpop.go
++++ b/backend/internal/infra/provider/console/dpop.go
+@@ -402,7 +402,7 @@
+ 		if response.StatusCode == http.StatusUnauthorized {
+ 			return normalizeConsoleTransientUnauthorized(response)
+ 		}
+-		if useAPIKey && !apiKeyRepaired && (response.StatusCode == http.StatusTooManyRequests || response.StatusCode == http.StatusForbidden) {
++		if useAPIKey && !apiKeyRepaired && (response.StatusCode == http.StatusBadRequest || response.StatusCode == http.StatusTooManyRequests || response.StatusCode == http.StatusForbidden) {
+ 			data, truncated, readErr := provider.ReadDiagnosticBody(response.Body)
+ 			_ = response.Body.Close()
+ 			if readErr != nil {
+--- a/backend/internal/infra/provider/console/console_protocol_test.go
++++ b/backend/internal/infra/provider/console/console_protocol_test.go
+@@ -739,3 +739,42 @@
+ 		t.Fatalf("string/float cents = %#v, %v", status, err)
+ 	}
+ }
++
++func TestConsoleAPIKeyRepairsIncorrectKeyBadRequest(t *testing.T) {
++	var responseCalls atomic.Int32
++	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
++		switch request.URL.Path {
++		case "/v1/dpop/token":
++			serveTestDPoPToken(t, writer, request)
++		case "/":
++			_, _ = io.WriteString(writer, consoleHomeHTML(testTeamID, consoleHomeKey(testTeamID, testNewKeyID, false)))
++		case "/v1/responses":
++			responseCalls.Add(1)
++			if request.Header.Get(consoleAPIKeyHeader) != testNewKeyID {
++				writer.Header().Set("Content-Type", "application/json")
++				writer.WriteHeader(http.StatusBadRequest)
++				_, _ = io.WriteString(writer, `{"code":"Some resource has been exhausted","error":"Incorrect API key provided. You can obtain an API key from https://console.x.ai."}`)
++				return
++			}
++			writer.Header().Set("Content-Type", "application/json")
++			_, _ = io.WriteString(writer, `{"id":"resp_1","object":"response","status":"completed","output":[]}`)
++		default:
++			http.NotFound(writer, request)
++		}
++	}))
++	defer server.Close()
++	adapter, credential := newConsoleTestAdapter(t, server.URL)
++	store := newRecordingCacheStore()
++	adapter.SetCredentialCacheStore(store)
++	response, err := adapter.ForwardResponse(context.Background(), provider.ResponseResourceRequest{
++		Credential: credential, Method: http.MethodPost, Path: "/responses", Model: "grok-4.3",
++		Operation: conversation.OperationResponses, Body: []byte(`{"model":"grok-4.3","input":"hi"}`), NormalizeBody: true,
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	_ = response.Body.Close()
++	if response.StatusCode != http.StatusOK || responseCalls.Load() != 2 || store.apiKey(credential.ID) != testNewKeyID {
++		t.Fatalf("status=%d calls=%d stored=%q", response.StatusCode, responseCalls.Load(), store.apiKey(credential.ID))
++	}
++}
+--- a/backend/internal/infra/provider/web/attachments.go
++++ b/backend/internal/infra/provider/web/attachments.go
+@@ -395,7 +395,11 @@
+ 
+ func newRemoteImageTarget(original *url.URL, serverName string, address netip.Addr) *remoteImageTarget {
+ 	fetchURL := *original
+-	fetchURL.Host = net.JoinHostPort(address.String(), "443")
++	port := original.Port()
++	if port == "" {
++		port = "443"
++	}
++	fetchURL.Host = net.JoinHostPort(address.String(), port)
+ 	fetchURL.Fragment = ""
+ 	return &remoteImageTarget{originalURL: original, fetchURL: &fetchURL, serverName: serverName, hostHeader: original.Host}
+ }
+--- a/backend/internal/infra/provider/web/attachments_test.go
++++ b/backend/internal/infra/provider/web/attachments_test.go
+@@ -55,3 +55,23 @@
+ func (r staticImageResolver) LookupNetIP(context.Context, string, string) ([]netip.Addr, error) {
+ 	return append([]netip.Addr(nil), r.addresses...), nil
+ }
++
++func TestRemoteImageTargetPreservesCustomHTTPSPort(t *testing.T) {
++	resolver := &rebindingImageResolver{}
++	target, err := validateRemoteImageURLWithResolver(context.Background(), "https://images.example.test:8443/photo.png?size=large", resolver)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if resolver.calls != 1 {
++		t.Fatalf("resolver calls = %d, want 1", resolver.calls)
++	}
++	if target.originalURL.Host != "images.example.test:8443" || target.fetchURL.Host != "93.184.216.34:8443" {
++		t.Fatalf("target = %#v", target)
++	}
++	if target.hostHeader != "images.example.test:8443" || target.serverName != "images.example.test" {
++		t.Fatalf("host=%q serverName=%q", target.hostHeader, target.serverName)
++	}
++	if target.fetchURL.Path != "/photo.png" || target.fetchURL.RawQuery != "size=large" {
++		t.Fatalf("fetch URL = %s", target.fetchURL)
++	}
++}
+--- a/backend/internal/infra/egress/pinnedclient.go
++++ b/backend/internal/infra/egress/pinnedclient.go
+@@ -8,6 +8,7 @@
+ 	"net/http"
+ 	"net/netip"
+ 	"net/url"
++	"strconv"
+ 	"strings"
+ 	"time"
+ 
+@@ -23,8 +24,16 @@
+ 	if l == nil {
+ 		return nil, errors.New("出口租约未初始化")
+ 	}
+-	if request == nil || request.URL == nil || request.URL.Scheme != "https" || request.URL.Port() != "443" {
+-		return nil, errors.New("固定地址请求必须使用 HTTPS 443")
++	if request == nil || request.URL == nil || request.URL.Scheme != "https" {
++		return nil, errors.New("固定地址请求必须使用 HTTPS")
++	}
++	port := request.URL.Port()
++	if port == "" {
++		port = "443"
++	}
++	n, portErr := strconv.Atoi(port)
++	if portErr != nil || n < 1 || n > 65535 {
++		return nil, errors.New("固定地址请求端口无效")
+ 	}
+ 	address, err := netip.ParseAddr(request.URL.Hostname())
+ 	if err != nil {
+@@ -38,6 +47,13 @@
+ 	hostURL, err := url.Parse("https://" + request.Host)
+ 	if err != nil || strings.TrimSuffix(strings.ToLower(hostURL.Hostname()), ".") != serverName {
+ 		return nil, errors.New("固定地址请求的 Host 与 TLS ServerName 不一致")
++	}
++	hostPort := hostURL.Port()
++	if hostPort == "" {
++		hostPort = "443"
++	}
++	if hostPort != port {
++		return nil, errors.New("固定地址请求的 Host 与连接端口不一致")
+ 	}
+ 	client, err := newPinnedHTTPSClient(l.ProxyURL, serverName, nil)
+ 	if err != nil {
+--- a/backend/internal/infra/egress/pinnedclient_test.go
++++ b/backend/internal/infra/egress/pinnedclient_test.go
+@@ -146,3 +146,26 @@
+ 		t.Fatal("private target was accepted")
+ 	}
+ }
++
++func TestLeasePinnedHTTPSPreservesCustomPort(t *testing.T) {
++	connected := make(chan string, 1)
++	proxyServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
++		connected <- request.Host
++		http.Error(writer, "stop", http.StatusBadGateway)
++	}))
++	defer proxyServer.Close()
++	request, err := http.NewRequest(http.MethodGet, "https://93.184.216.34:8443/image.png", nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	request.Host = "images.example.test:8443"
++	_, _ = (&Lease{ProxyURL: proxyServer.URL}).DoPinnedHTTPS(request, "images.example.test")
++	select {
++	case host := <-connected:
++		if host != "93.184.216.34:8443" {
++			t.Fatalf("proxy CONNECT host = %q", host)
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("proxy did not receive CONNECT")
++	}
++}
+--- a/backend/internal/infra/provider/web/video.go
++++ b/backend/internal/infra/provider/web/video.go
+@@ -251,8 +251,8 @@
+ }
+ 
+ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoRequest) (provider.VideoResult, error) {
+-	if strings.TrimSpace(request.ImageURL) != "" || len(request.ReferenceURLs) > 0 {
+-		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, fmt.Errorf("Grok Web 当前仅支持文本生视频；图片视频请使用 Build 或 Console Provider"))
++	if len(request.ReferenceURLs) > 0 {
++		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, fmt.Errorf("Grok Web 暂不支持多图参考视频，请使用单张首帧图片"))
+ 	}
+ 	cfg := a.config()
+ 	token, err := a.cipher.Decrypt(request.Credential.EncryptedAccessToken)
+@@ -275,6 +275,24 @@
+ 		resolution = "720p"
+ 	}
+ 	payload := videoCreatePayload(request.Prompt, ratio, resolution, segments[0])
++	if imageURL := strings.TrimSpace(request.ImageURL); imageURL != "" {
++		file, err := a.loadChatImage(ctx, lease, imageURL, cfg.MaxInputImageBytes)
++		if err != nil {
++			return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, err)
++		}
++		uploaded, err := a.uploadFileV2Direct(ctx, cfg, lease, token, file, cfg.BaseURL+"/imagine", imagineSelfUploadSource, "video_image_upload")
++		if err != nil {
++			return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, err)
++		}
++		if uploaded.MetadataID == "" {
++			return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, fmt.Errorf("视频首帧上传未返回文件元数据标识"))
++		}
++		media := payload["mediaGenInput"].(map[string]any)
++		input := media["textToVideo"].(map[string]any)
++		input["inputAssets"] = []string{uploaded.MetadataID}
++		delete(media, "textToVideo")
++		media["imageToVideo"] = input
++	}
+ 	response, err := a.postJSON(ctx, cfg, lease, token, cfg.BaseURL+"/rest/app-chat/conversations/new", payload, time.Duration(cfg.VideoTimeoutSeconds)*time.Second)
+ 	if err != nil {
+ 		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoCreateFailureStage(err), 0, err)
+--- a/backend/internal/application/gateway/video.go
++++ b/backend/internal/application/gateway/video.go
+@@ -239,8 +239,8 @@
+ 	}
+ 	trimmedModel := strings.TrimSpace(upstreamModel)
+ 	hasReferences := referenceCount > 0
+-	if providerValue == account.ProviderWeb && (hasImage || hasReferences) {
+-		return fmt.Errorf("%w: Grok Web 当前仅支持文本生视频；图片视频请使用 Build 或 Console Provider", ErrVideoOperationUnsupported)
++	if providerValue == account.ProviderWeb && hasReferences {
++		return fmt.Errorf("%w: Grok Web 暂不支持多图参考视频，请使用单张首帧图片", ErrVideoOperationUnsupported)
+ 	}
+ 	if providerValue == account.ProviderConsole && (trimmedModel == "grok-imagine-video" || trimmedModel == "grok-imagine-video-1.5") {
+ 		// 实测：8 张 reference_images 上游回 400
+--- a/backend/internal/application/gateway/video_test.go
++++ b/backend/internal/application/gateway/video_test.go
+@@ -205,11 +205,11 @@
+ 	if err := validateVideoRouteParameters(account.ProviderBuild, provider.VideoOperationGenerate, "grok-imagine-video-1.5", "720p", false, 8, 15); err != nil {
+ 		t.Fatalf("Build 1.5 references error = %v", err)
+ 	}
+-	// Web 新协议只有文本生视频抓包证据；不能退回已删除的 media-post 旧链路。
++	// Web accepts text and uploaded first frames; multi-reference remains unsupported.
+ 	if err := validateVideoRouteParameters(account.ProviderWeb, provider.VideoOperationGenerate, "grok-imagine-video", "720p", false, 0, 15); err != nil {
+ 		t.Fatalf("Web text video error = %v", err)
+ 	}
+-	if err := validateVideoRouteParameters(account.ProviderWeb, provider.VideoOperationGenerate, "grok-imagine-video", "720p", true, 0, 6); !errors.Is(err, ErrVideoOperationUnsupported) {
++	if err := validateVideoRouteParameters(account.ProviderWeb, provider.VideoOperationGenerate, "grok-imagine-video", "720p", true, 0, 6); err != nil {
+ 		t.Fatalf("Web image video error = %v", err)
+ 	}
+ 	if err := validateVideoRouteParameters(account.ProviderWeb, provider.VideoOperationGenerate, "grok-imagine-video", "720p", false, 1, 6); !errors.Is(err, ErrVideoOperationUnsupported) {
+--- /dev/null
++++ b/backend/internal/infra/provider/web/video_image_test.go
+@@ -0,0 +1,71 @@
++package web
++
++import (
++	"context"
++	"encoding/json"
++	fhttp "github.com/bogdanfinn/fhttp"
++	fhttptest "github.com/bogdanfinn/fhttp/httptest"
++	"github.com/chenyme/grok2api/backend/internal/infra/provider"
++	"testing"
++)
++
++func TestVideoFirstFrameUploadsBeforeGeneration(t *testing.T) {
++	for _, missingMetadata := range []bool{false, true} {
++		t.Run(map[bool]string{false: "first-frame", true: "missing-metadata"}[missingMetadata], func(t *testing.T) {
++			uploads, generations := 0, 0
++			server := fhttptest.NewServer(fhttp.HandlerFunc(func(w fhttp.ResponseWriter, r *fhttp.Request) {
++				switch r.URL.Path {
++				case "/http/upload-file-v2/direct":
++					uploads++
++					if err := r.ParseMultipartForm(1 << 20); err != nil {
++						t.Error(err)
++						return
++					}
++					if r.FormValue("file_source") != imagineSelfUploadSource {
++						t.Errorf("file source missing: %q", r.FormValue("file_source"))
++					}
++
++					w.Header().Set("Content-Type", "application/json")
++					if missingMetadata {
++						w.Write([]byte(`{"fileId":"generic-only"}`))
++						return
++					}
++					w.Write([]byte(`{"uploadId":"generic-upload","fileMetadata":{"fileMetadataId":"first-frame-id","fileUri":"users/test/image.png"}}`))
++				case "/rest/app-chat/conversations/new":
++					generations++
++					var body map[string]any
++					if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
++						t.Error(err)
++						return
++					}
++					media := body["mediaGenInput"].(map[string]any)
++					if _, exists := media["textToVideo"]; exists {
++						t.Error("first frame silently dropped into text-to-video")
++					}
++					input := media["imageToVideo"].(map[string]any)
++					assets := input["inputAssets"].([]any)
++					if len(assets) != 1 || assets[0] != "first-frame-id" || uploads != 1 {
++						t.Errorf("wrong first frame: %#v uploads=%d", assets, uploads)
++					}
++					w.Header().Set("Content-Type", "text/event-stream")
++					w.Write([]byte("data: {\"result\":{\"response\":{\"streamingVideoGenerationResponse\":{\"progress\":100,\"videoUrl\":\"https://assets.grok.com/video.mp4\"}}}}\n\n"))
++				default:
++					fhttp.NotFound(w, r)
++				}
++			}))
++			defer server.Close()
++			adapter, credential := testMediaAdapter(t, server.URL)
++			result, err := adapter.GenerateVideo(context.Background(), provider.VideoRequest{
++				Credential: credential, Prompt: "animate the cup", Duration: 6, Resolution: "720p",
++				ImageURL: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
++			})
++			if missingMetadata {
++				if err == nil || generations != 0 {
++					t.Fatalf("missing metadata err=%v generations=%d", err, generations)
++				}
++			} else if err != nil || result.URL == "" || generations != 1 {
++				t.Fatalf("result=%#v err=%v generations=%d", result, err, generations)
++			}
++		})
++	}
++}
+--- a/backend/internal/infra/provider/web/image.go
++++ b/backend/internal/infra/provider/web/image.go
+@@ -928,7 +928,9 @@
+ 	return map[string]any{
+ 		"modelName": "imagine-image-edit", "message": prompt,
+ 		"enableImageStreaming": true, "enableSideBySide": true, "sendFinalMetadata": true,
+-		"mediaGenInput": map[string]any{"imageToImage": imageToImage},
++		"mediaGenInput":    map[string]any{"imageToImage": imageToImage},
++		"kind":             "CONVERSATION_KIND_IMAGINE",
++		"responseMetadata": map[string]any{"modelConfigOverride": map[string]any{"modelMap": map[string]any{"imageEditModel": "imagine"}}},
+ 	}
+ }
+ 
+--- a/backend/internal/infra/provider/web/protocol_test.go
++++ b/backend/internal/infra/provider/web/protocol_test.go
+@@ -862,14 +862,14 @@
+ 	if !ok {
+ 		t.Fatalf("imageToImage = %#v", mediaGenInput["imageToImage"])
+ 	}
+-	if len(payload) != 6 || payload["modelName"] != "imagine-image-edit" || payload["message"] != "改成兔子" ||
++	if len(payload) != 8 || payload["modelName"] != "imagine-image-edit" || payload["message"] != "改成兔子" ||
+ 		payload["enableImageStreaming"] != true || payload["enableSideBySide"] != true || payload["sendFinalMetadata"] != true {
+ 		t.Fatalf("payload = %#v", payload)
+ 	}
+ 	if imageToImage["prompt"] != "改成兔子" || imageToImage["aspectRatio"] != "1:1" || !slices.Equal(imageToImage["inputAssets"].([]string), assets) {
+ 		t.Fatalf("imageToImage = %#v", imageToImage)
+ 	}
+-	for _, field := range []string{"temporary", "enableImageGeneration", "imageGenerationCount", "config", "responseMetadata", "kind", "parentPostId"} {
++	for _, field := range []string{"temporary", "enableImageGeneration", "imageGenerationCount", "config", "parentPostId"} {
+ 		if _, exists := payload[field]; exists {
+ 			t.Fatalf("legacy field %q leaked into payload: %#v", field, payload)
+ 		}
+@@ -1856,3 +1856,16 @@
+ 		t.Fatalf("expected target-image-1, got %s", collector.Images()[0].ID)
+ 	}
+ }
++
++func TestImageEditPayloadUsesImagineConversation(t *testing.T) {
++	payload := buildImageEditPayload("blue triangle", []string{"first-frame"}, "1:1")
++	if payload["kind"] != "CONVERSATION_KIND_IMAGINE" {
++		t.Fatal("wrong conversation kind")
++	}
++	metadata := payload["responseMetadata"].(map[string]any)
++	override := metadata["modelConfigOverride"].(map[string]any)
++	models := override["modelMap"].(map[string]any)
++	if models["imageEditModel"] != "imagine" {
++		t.Fatal("missing Imagine edit model")
++	}
++}
