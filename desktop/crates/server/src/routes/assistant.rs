@@ -1,17 +1,14 @@
 //! AI 助手：会话记录 + Agent 流水线（SSE）。
 
-use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
-use axum::response::sse::{Event, Sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 use sqlx::Row;
 
-use fusion_ai::agent::{AgentEvent, AgentRunner};
 use fusion_ai::types::ChatMessage;
 use fusion_core::error::AppError;
 use fusion_core::models::agent::{
@@ -21,9 +18,15 @@ use fusion_core::models::agent::{
 
 use crate::auth::AuthUser;
 use crate::routes::ai::{load_model, resolve_provider_config};
-use crate::routes::tools::AssistantTools;
 use crate::state::AppState;
 use crate::support::{now, ok, ApiResult};
+
+mod pipeline;
+use pipeline::*;
+
+pub(crate) async fn recover_interrupted(state: &Arc<AppState>) -> Result<(), AppError> {
+    pipeline::recover_interrupted(state).await
+}
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
@@ -210,7 +213,7 @@ async fn delete_by_business_id(
     ok(true)
 }
 
-#[derive(Deserialize, Default)]
+#[derive(serde::Serialize, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ChatReq {
     pub message: Option<String>,
@@ -222,6 +225,11 @@ pub struct ChatReq {
     pub system_prompt: Option<String>,
     pub instruction: Option<String>,
     pub enabled_tools: Option<Vec<String>>,
+    pub agent_type: Option<String>,
+    pub context: Option<serde_json::Value>,
+    pub tool_execution_mode: Option<String>,
+    pub enabled_skills: Option<Vec<String>>,
+    pub references_json: Option<String>,
 }
 
 async fn resolve_model(state: &AppState, model_id: Option<i64>) -> Result<fusion_core::models::ai::AiModel, AppError> {
@@ -269,6 +277,13 @@ async fn build_system_prompt(state: &AppState, req: &ChatReq) -> String {
         }
     }
 
+    if let Some(skills) = &req.enabled_skills {
+        for skill in super::agent_config::read_skills(state) {
+            if skills.iter().any(|name| name == &skill.name || name == &skill.id) {
+                prompt.push_str(&format!("\n用户选中的 Skill {}：\n{}\n", skill.name, skill.content.chars().take(32000).collect::<String>()));
+            }
+        }
+    }
     if let Some(extra) = &req.system_prompt {
         if !extra.trim().is_empty() {
             prompt.push_str("\n额外要求：\n");
@@ -299,20 +314,27 @@ async fn ensure_conversation(
         }
     }
 
-    let conversation_id = format!("conv_{}", uuid::Uuid::new_v4().simple());
+    // The frontend creates the business ID optimistically. Returning another
+    // ID splits the live transcript from persisted history and status polling.
+    let conversation_id = req.conversation_id.as_deref().map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("conv_{}", uuid::Uuid::new_v4().simple()));
+    if conversation_id.len() > 128 { return Err(AppError::bad_request("会话 ID 过长")); }
     let title = req
         .title
         .clone()
         .filter(|t| !t.trim().is_empty())
         .unwrap_or_else(|| first_message.chars().take(24).collect());
     let id =     sqlx::query(
-        "INSERT INTO afv_agent_conversation (conversation_id, user_id, title, project_id, category, status, deleted, create_time, update_time) VALUES (?, ?, ?, ?, ?, 'active', 0, ?, ?)",
+        "INSERT INTO afv_agent_conversation (conversation_id, user_id, title, project_id, category, agent_type, status, deleted, create_time, update_time) VALUES (?, ?, ?, ?, ?, ?, 'completed', 0, ?, ?)",
     )
     .bind(&conversation_id)
     .bind(user_id)
     .bind(&title)
     .bind(req.project_id)
     .bind(req.category.as_deref().filter(|v| !v.trim().is_empty()).unwrap_or("assistant"))
+    .bind(req.agent_type.as_deref().unwrap_or("assistant"))
     .bind(now())
     .bind(now())
     .execute(&state.db)
@@ -329,14 +351,10 @@ async fn save_message(
     metadata: Option<serde_json::Value>,
 ) -> Result<(), AppError> {
     // message_order 由会话表的 next_message_order 递增分配，保证同一会话内严格有序。
-    let order: i64 = sqlx::query_scalar::<_, Option<i64>>(
-        "SELECT next_message_order FROM afv_agent_conversation WHERE conversation_id = ?",
-    )
-    .bind(conversation_id)
-    .fetch_optional(&state.db)
-    .await?
-    .flatten()
-    .unwrap_or(1);
+    let mut tx = state.db.begin().await?;
+    let order: i64 = sqlx::query_scalar(
+        "UPDATE afv_agent_conversation SET next_message_order = next_message_order + 1 WHERE conversation_id = ? RETURNING next_message_order - 1",
+    ).bind(conversation_id).fetch_one(&mut *tx).await?;
 
     sqlx::query(
         "INSERT INTO afv_agent_message (conversation_id, role, content, references_json, message_order, deleted, create_time, update_time) VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
@@ -348,17 +366,17 @@ async fn save_message(
     .bind(order)
     .bind(now())
     .bind(now())
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await?;
     sqlx::query(
-        "UPDATE afv_agent_conversation SET next_message_order = ?, message_count = message_count + 1, last_message_time = ?, update_time = ? WHERE conversation_id = ?",
+        "UPDATE afv_agent_conversation SET message_count = message_count + 1, last_message_time = ?, update_time = ? WHERE conversation_id = ?",
     )
-    .bind(order + 1)
     .bind(now())
     .bind(now())
     .bind(conversation_id)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -383,340 +401,6 @@ async fn load_history(state: &AppState, conversation_id: &str, limit: usize) -> 
         messages.push(ChatMessage::user("继续"));
     }
     Ok(messages)
-}
-
-/// SSE 响应封装：把 AgentEvent 转成前端约定的 outputType 事件。
-fn sse_from_events(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
-    run_id: String,
-    conversation_id: String,
-) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
-    let mut sequence: i64 = 0;
-    let stream = async_stream::stream! {
-        while let Some(event) = rx.recv().await {
-            sequence += 1;
-            let payload = match event {
-                AgentEvent::Delta(text) => json!({
-                    "outputType": "CONTENT",
-                    "content": text,
-                    "runId": run_id,
-                    "conversationId": conversation_id,
-                    "sequence": sequence,
-                }),
-                AgentEvent::Reasoning(text) => json!({
-                    "outputType": "REASONING",
-                    "reasoningContent": text,
-                    "runId": run_id,
-                    "conversationId": conversation_id,
-                    "sequence": sequence,
-                }),
-                AgentEvent::Message(text) => json!({
-                    "outputType": "CONTENT",
-                    "content": text,
-                    "finished": false,
-                    "runId": run_id,
-                    "conversationId": conversation_id,
-                    "sequence": sequence,
-                }),
-                AgentEvent::ToolStarted { name, arguments } => json!({
-                    "outputType": "TOOL_CALL_STARTED",
-                    "toolName": name,
-                    "toolCallId": format!("call_{sequence}"),
-                    "toolCalls": [{ "id": format!("call_{sequence}"), "name": name, "arguments": arguments.to_string() }],
-                    "runId": run_id,
-                    "conversationId": conversation_id,
-                    "sequence": sequence,
-                }),
-                AgentEvent::ToolFinished { name, result, ok } => json!({
-                    "outputType": "TOOL_FINISHED",
-                    "toolName": name,
-                    "toolResult": result,
-                    "toolStatus": if ok { "success" } else { "error" },
-                    "runId": run_id,
-                    "conversationId": conversation_id,
-                    "sequence": sequence,
-                }),
-                AgentEvent::Status(text) => json!({
-                    "outputType": "CONTENT",
-                    "content": "",
-                    "source": text,
-                    "runId": run_id,
-                    "conversationId": conversation_id,
-                    "sequence": sequence,
-                }),
-                AgentEvent::Finished { content } => json!({
-                    "outputType": "DONE",
-                    "content": content,
-                    "finished": true,
-                    "runId": run_id,
-                    "conversationId": conversation_id,
-                    "sequence": sequence,
-                }),
-                AgentEvent::Failed(error) => json!({
-                    "outputType": "ERROR",
-                    "error": error,
-                    "finished": true,
-                    "runId": run_id,
-                    "conversationId": conversation_id,
-                    "sequence": sequence,
-                }),
-            };
-            yield Ok(Event::default().data(payload.to_string()));
-        }
-    };
-    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
-}
-
-async fn run_pipeline(
-    State(state): State<Arc<AppState>>,
-    user: AuthUser,
-    Json(req): Json<ChatReq>,
-) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, AppError> {
-    let message = req
-        .message
-        .clone()
-        .filter(|m| !m.trim().is_empty())
-        .ok_or_else(|| AppError::bad_request("消息不能为空"))?;
-
-    let (conv_row_id, conversation_id) = ensure_conversation(&state, &req, user.id, &message).await?;
-    save_message(&state, &conversation_id, "user", &message, None).await?;
-
-    let model = resolve_model(&state, req.model_id).await?;
-    let (platform, cfg) = resolve_provider_config(&state, &model).await?;
-    let provider = state.registry.chat(&platform)?;
-
-    let mut messages = vec![ChatMessage::system(build_system_prompt(&state, &req).await)];
-    messages.extend(load_history(&state, &conversation_id, 30).await?);
-
-    let run_id = format!("run_{}", uuid::Uuid::new_v4().simple());
-    // afv_agent_run 没有 input/output/model_id 列：模型与首条输入记在快照 JSON 里，
-    // 输出通过 afv_agent_message 投影，状态与错误分别落在 status / error_code / error_message。
-    let snapshot = serde_json::json!({
-        "modelId": model.id,
-        "modelCode": model.code,
-        "input": message,
-    });
-    let _ = sqlx::query(
-        "INSERT INTO afv_agent_run (run_id, conversation_id, user_id, project_id, agent_type, agent_definition_snapshot_json, status, started_at, create_time, update_time) VALUES (?, ?, ?, ?, 'assistant', ?, 'running', ?, ?, ?)",
-    )
-    .bind(&run_id)
-    .bind(&conversation_id)
-    .bind(user.id)
-    .bind(req.project_id)
-    .bind(snapshot.to_string())
-    .bind(now())
-    .bind(now())
-    .bind(now())
-    .execute(&state.db)
-    .await;
-
-    let tools = Arc::new(AssistantTools {
-        state: state.clone(),
-        user_id: user.id,
-    });
-    let runner = AgentRunner::new(provider, cfg, model.code.clone(), tools);
-
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let state_clone = state.clone();
-    let run_id_clone = run_id.clone();
-    let conversation_clone = conversation_id.clone();
-    tokio::spawn(async move {
-        let result = runner.run(messages, tx.clone()).await;
-        match &result {
-            Ok(content) => {
-                let _ = save_message(&state_clone, &conversation_clone, "assistant", content, None).await;
-                let _ = sqlx::query(
-                    "UPDATE afv_agent_run SET status = 'completed', finished_at = ?, update_time = ? WHERE run_id = ?",
-                )
-                .bind(now())
-                .bind(now())
-                .bind(&run_id_clone)
-                .execute(&state_clone.db)
-                .await;
-            }
-            Err(err) => {
-                let _ = tx.send(AgentEvent::Failed(err.to_string())).ok();
-                let _ = sqlx::query(
-                    "UPDATE afv_agent_run SET status = 'failed', error_code = 'provider_error', error_message = ?, finished_at = ?, update_time = ? WHERE run_id = ?",
-                )
-                .bind(err.to_string())
-                .bind(now())
-                .bind(now())
-                .bind(&run_id_clone)
-                .execute(&state_clone.db)
-                .await;
-            }
-        }
-        let _ = conv_row_id;
-    });
-
-    Ok(sse_from_events(rx, run_id, conversation_id))
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ContinueQuery {
-    conversation_id: String,
-}
-
-async fn continue_pipeline(
-    State(state): State<Arc<AppState>>,
-    user: AuthUser,
-    Query(q): Query<ContinueQuery>,
-) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, AppError> {
-    run_pipeline(
-        State(state),
-        user,
-        Json(ChatReq {
-            message: Some("继续".into()),
-            conversation_id: Some(q.conversation_id),
-            ..Default::default()
-        }),
-    )
-    .await
-}
-
-#[derive(Deserialize)]
-struct ReconnectQuery {
-    #[serde(rename = "runId")]
-    run_id: String,
-    #[serde(rename = "afterSequence", default)]
-    _after_sequence: i64,
-}
-
-/// 桌面端不持久化流式字节，重连时返回终态，由前端从消息表恢复。
-async fn reconnect_pipeline(
-    State(state): State<Arc<AppState>>,
-    _u: AuthUser,
-    Query(q): Query<ReconnectQuery>,
-) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, AppError> {
-    let row = sqlx::query(
-        "SELECT status, error_message, conversation_id FROM afv_agent_run WHERE run_id = ?",
-    )
-    .bind(&q.run_id)
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or_else(|| AppError::not_found("运行记录不存在"))?;
-    let status: String = row.get("status");
-    let error: Option<String> = row.get("error_message");
-    let conversation_id: Option<String> = row.get("conversation_id");
-
-    // 输出不落在 run 表，取该会话最后一条 assistant 消息作为终态内容。
-    let output: Option<String> = match &conversation_id {
-        Some(cid) => sqlx::query_scalar::<_, Option<String>>(
-            "SELECT content FROM afv_agent_message WHERE conversation_id = ? AND role = 'assistant' AND deleted = 0 ORDER BY message_order DESC, id DESC LIMIT 1",
-        )
-        .bind(cid)
-        .fetch_optional(&state.db)
-        .await?
-        .flatten(),
-        None => None,
-    };
-
-    let payload = json!({
-        "outputType": if status == "failed" { "ERROR" } else { "DONE" },
-        "content": output,
-        "error": error,
-        "finished": true,
-        "runId": q.run_id,
-        "conversationId": conversation_id,
-    });
-    let stream = futures_util::stream::iter(vec![Ok(Event::default().data(payload.to_string()))]);
-    Ok(Sse::new(stream))
-}
-
-#[derive(Deserialize, Default)]
-#[serde(rename_all = "camelCase", default)]
-struct CancelReq {
-    run_id: Option<String>,
-    conversation_id: Option<String>,
-}
-
-async fn cancel_pipeline(
-    State(state): State<Arc<AppState>>,
-    _u: AuthUser,
-    Json(req): Json<CancelReq>,
-) -> ApiResult<bool> {
-    if let Some(run_id) = req.run_id {
-        sqlx::query(
-            "UPDATE afv_agent_run SET status = 'cancelled', finished_at = ?, update_time = ? WHERE run_id = ?",
-        )
-        .bind(now())
-        .bind(now())
-        .bind(run_id)
-        .execute(&state.db)
-        .await?;
-    }
-    ok(true)
-}
-
-#[derive(Deserialize, Default)]
-#[serde(rename_all = "camelCase", default)]
-struct ConfirmReq {
-    run_id: Option<String>,
-    approved: Option<bool>,
-}
-
-async fn confirm_pipeline(
-    State(_state): State<Arc<AppState>>,
-    _u: AuthUser,
-    Json(_req): Json<ConfirmReq>,
-) -> ApiResult<bool> {
-    // 桌面端默认全自动执行；确认接口保留以兼容前端交互。
-    ok(true)
-}
-
-async fn expire_confirmation(
-    State(_state): State<Arc<AppState>>,
-    _u: AuthUser,
-) -> ApiResult<bool> {
-    ok(true)
-}
-
-#[derive(Deserialize)]
-struct StatusQuery {
-    #[serde(rename = "runId")]
-    run_id: String,
-}
-
-async fn pipeline_status(
-    State(state): State<Arc<AppState>>,
-    _u: AuthUser,
-    Query(q): Query<StatusQuery>,
-) -> ApiResult<serde_json::Value> {
-    let row = sqlx::query("SELECT status FROM afv_agent_run WHERE run_id = ?")
-        .bind(&q.run_id)
-        .fetch_optional(&state.db)
-        .await?;
-    match row {
-        Some(row) => {
-            let status: String = row.get("status");
-            ok(json!({ "runId": q.run_id, "status": status }))
-        }
-        None => ok(json!({ "runId": q.run_id, "status": "unknown" })),
-    }
-}
-
-async fn running_pipelines(
-    State(state): State<Arc<AppState>>,
-    _u: AuthUser,
-) -> ApiResult<Vec<serde_json::Value>> {
-    let rows = sqlx::query(
-        "SELECT run_id, conversation_id, status, started_at FROM afv_agent_run WHERE status = 'running' ORDER BY id DESC LIMIT 50",
-    )
-    .fetch_all(&state.db)
-    .await?;
-    ok(rows
-        .into_iter()
-        .map(|row| {
-            json!({
-                "runId": row.get::<String, _>("run_id"),
-                "conversationId": row.get::<Option<String>, _>("conversation_id"),
-                "status": row.get::<String, _>("status"),
-                "startedAt": row.get::<Option<String>, _>("started_at"),
-            })
-        })
-        .collect())
 }
 
 #[cfg(test)]
@@ -797,4 +481,33 @@ mod contract_tests {
         assert_eq!(page["list"][0]["conversationId"], "other");
         cleanup(state).await;
     }
+    #[tokio::test]
+    async fn pipeline_replays_identified_events_and_preserves_client_conversation() {
+        use axum::response::IntoResponse;
+        let state = fixture().await;
+        let request = ChatReq { conversation_id: Some("client-created-id".into()), ..Default::default() };
+        let (_, conversation_id) = ensure_conversation(&state, &request, 1, "测试").await.unwrap();
+        assert_eq!(conversation_id, "client-created-id");
+        sqlx::query("INSERT INTO afv_agent_run (run_id, conversation_id, status) VALUES (?, ?, 'RUNNING')")
+            .bind("run-test").bind(&conversation_id).execute(&state.db).await.unwrap();
+        append_event(&state, "run-test", json!({"outputType": "CONTENT", "content": "已完成"})).await.unwrap();
+        append_event(&state, "run-test", json!({"outputType": "DONE", "finished": true})).await.unwrap();
+        let query = serde_json::from_value(json!({"runId": "run-test", "afterSequence": 1})).unwrap();
+        let response = reconnect_pipeline(State(state.clone()), AuthUser::anonymous(), Query(query)).await.unwrap().into_response();
+        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("id: run-test:2"));
+        assert!(!text.contains("id: run-test:1"));
+        let event: serde_json::Value = serde_json::from_str(text.lines().find_map(|line| line.strip_prefix("data: ")).unwrap()).unwrap();
+        assert_eq!(event["schemaVersion"], 1);
+        assert_eq!(event["sequence"], 2);
+        assert_eq!(event["conversationId"], "client-created-id");
+        assert_eq!(event["outputType"], "DONE");
+        let query = serde_json::from_value(json!({"conversationId": "client-created-id"})).unwrap();
+        let status = pipeline_status(State(state.clone()), AuthUser::anonymous(), Query(query)).await.unwrap().0.data.unwrap();
+        assert_eq!(status["status"], "COMPLETED");
+        assert_eq!(status["lastSequence"], 2);
+        cleanup(state).await;
+    }
+
 }

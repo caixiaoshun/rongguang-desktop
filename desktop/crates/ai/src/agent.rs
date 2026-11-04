@@ -23,14 +23,18 @@ pub enum AgentEvent {
     /// 一轮模型调用的完整正文（增量结束后发送，便于前端落库）
     Message(String),
     ToolStarted {
+        id: String,
         name: String,
         arguments: Value,
     },
     ToolFinished {
+        id: String,
         name: String,
         result: String,
         ok: bool,
     },
+    ConfirmationRequired { reply_id: String, call: ToolCall },
+    ConfirmationResolved { reply_id: String, tool_call_id: String, approved: bool },
     Status(String),
     Finished {
         content: String,
@@ -43,8 +47,10 @@ pub trait ToolExecutor: Send + Sync {
     fn definitions(&self) -> Vec<ToolDef>;
     async fn execute(&self, name: &str, arguments: Value) -> AppResult<String>;
     /// 需要用户确认的高风险工具（与 Java 版权限分级对齐）。
-    fn requires_confirmation(&self, _name: &str) -> bool {
-        false
+    fn requires_confirmation(&self, _name: &str) -> bool { false }
+    async fn authorize(&self, _call: &ToolCall, _reply_id: &str) -> AppResult<bool> {
+        // An executor that requests confirmation cannot silently execute without it.
+        Ok(false)
     }
 }
 
@@ -145,20 +151,25 @@ impl AgentRunner {
         let args: Value = serde_json::from_str(&call.function.arguments)
             .unwrap_or_else(|_| Value::Object(Default::default()));
 
-        if self.executor.requires_confirmation(&name) {
-            let _ = tx.send(AgentEvent::Status(format!(
-                "工具 {name} 需要确认，已跳过自动执行"
-            )));
-        }
-
         let _ = tx.send(AgentEvent::ToolStarted {
-            name: name.clone(),
-            arguments: args.clone(),
+            id: call.id.clone(), name: name.clone(), arguments: args.clone(),
         });
+        if self.executor.requires_confirmation(&name) {
+            let reply_id = format!("approval_{}", call.id);
+            let _ = tx.send(AgentEvent::ConfirmationRequired { reply_id: reply_id.clone(), call: call.clone() });
+            let approved = self.executor.authorize(call, &reply_id).await?;
+            let _ = tx.send(AgentEvent::ConfirmationResolved {
+                reply_id, tool_call_id: call.id.clone(), approved,
+            });
+            if !approved {
+                return Ok("{\"approved\":false,\"message\":\"用户未批准该操作，工具未执行\"}".into());
+            }
+        }
 
         match self.executor.execute(&name, args).await {
             Ok(result) => {
                 let _ = tx.send(AgentEvent::ToolFinished {
+                    id: call.id.clone(),
                     name,
                     result: truncate(&result, 4000),
                     ok: true,
@@ -167,6 +178,7 @@ impl AgentRunner {
             }
             Err(err) => {
                 let _ = tx.send(AgentEvent::ToolFinished {
+                    id: call.id.clone(),
                     name,
                     result: err.to_string(),
                     ok: false,

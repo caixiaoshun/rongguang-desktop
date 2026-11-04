@@ -68,6 +68,21 @@ impl ProviderConfig {
         format!("{}/v1", self.root())
     }
 
+    /// Generated media may point at a third-party CDN. Only the configured
+    /// provider origin can receive its credential.
+    pub fn media_auth(&self, url: &str) -> Option<&str> {
+        let provider = reqwest::Url::parse(&self.base_url).ok()?;
+        let media = reqwest::Url::parse(url).ok()?;
+        if matches!(provider.scheme(), "https" | "http")
+            && provider.origin() == media.origin()
+            && !self.api_key.is_empty()
+        {
+            Some(self.api_key.as_str())
+        } else {
+            None
+        }
+    }
+
     pub fn require_key(&self) -> AppResult<()> {
         if self.api_key.trim().is_empty() {
             return Err(AppError::bad_request(

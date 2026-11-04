@@ -1,6 +1,6 @@
 //! 全局状态：数据库、路径、配置、供应商注册表与任务登记。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use fusion_ai::provider::grok::GrokProvider;
@@ -16,6 +16,12 @@ use parking_lot::Mutex;
 /// 桌面版内置账号 ID。
 pub const LOCAL_USER_ID: i64 = 1;
 
+pub struct PendingToolConfirmation {
+    pub run_id: String,
+    pub tool_call_id: String,
+    pub sender: tokio::sync::oneshot::Sender<bool>,
+}
+
 pub struct AppState {
     pub db: Db,
     pub paths: AppPaths,
@@ -25,6 +31,8 @@ pub struct AppState {
     pub http: reqwest::Client,
     /// 正在取消的生成任务 ID
     pub canceled_tasks: Mutex<HashSet<String>>,
+    pub pipeline_cancellations: Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>,
+    pub pipeline_confirmations: Mutex<HashMap<String, PendingToolConfirmation>>,
 }
 
 impl AppState {
@@ -62,6 +70,8 @@ impl AppState {
             registry,
             http,
             canceled_tasks: Mutex::new(HashSet::new()),
+            pipeline_cancellations: Mutex::new(HashMap::new()),
+            pipeline_confirmations: Mutex::new(HashMap::new()),
         })
     }
 

@@ -1331,7 +1331,7 @@ dependencies = [
 
 [[package]]
 name = "fusion-ai"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1359,7 +1359,7 @@ dependencies = [
 
 [[package]]
 name = "fusion-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "axum",
@@ -1378,7 +1378,7 @@ dependencies = [
 
 [[package]]
 name = "fusion-server"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "argon2",
@@ -3738,7 +3738,7 @@ dependencies = [
 
 [[package]]
 name = "rongguang"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "fusion-core",

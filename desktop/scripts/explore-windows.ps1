@@ -207,7 +207,7 @@ try {
     Check 'project-scripts' { Click-Control '剧本' 'sidebar' } '剧本'
     Check 'project-storyboards' { Click-Control '分镜' 'sidebar' } '分镜'
     Check 'project-assets' { Click-Control '资产' 'sidebar' } '资产'
-    Check 'project-settings' { Click-Control '设置' 'sidebar' } '设置'
+    Check 'project-settings' { Click-Control '设置' 'sidebar' } @('项目设置', '项目名称', '保存设置')
     Check 'project-settings-save' {
         Type-Control 'project-name' 'UI-AUDIT-Renamed'
         Click-Control '保存设置'
@@ -216,7 +216,7 @@ try {
         Type-Control 'project-name' 'UI-AUDIT-Test'
         Click-Control '保存设置'
     } '项目设置已保存'
-    Check 'project-delete-dialog' { Click-Control '删除项目' } '彻底删除项目'
+    Check 'project-delete-dialog' { Click-Control '删除项目' 'any' 'accessibility' } '彻底删除项目'
     Check 'project-delete-cancel' { Click-Control '取消' } '项目设置'
     Check 'global-assets'  { Click-Control '资产' 'header' } '素材资产'
     Check 'image-workbench' { Click-Control '工具' 'header' } '生图'
