@@ -333,7 +333,7 @@ try {
         Click-Control '生视频' 'sidebar'
         if ($credentials.video_model_15) {
             Click-Control '选择生成模型'
-            Click-Control 'grok-imagine-video-1.5'
+            Click-Control 'Grok Imagine 视频 1.5 grok-imagine-video-1.5'
         }
         Test-Generation 'video' 'RGA-LIVE-VIDEO. Cinematic live action wide shot inside a quiet futuristic archive at night. An adult Chinese female archivist with short black hair and a beige coat gently picks up a glowing amber memory cube. Slow dolly in, subtle natural movement, teal and amber lighting, no captions, no logos.'
     }
