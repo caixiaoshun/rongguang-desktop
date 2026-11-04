@@ -116,6 +116,41 @@ def probe(credentials, output):
     return result["ok"]
 
 
+def probe_media(credentials, output):
+    """Distinguish a provider-side rejection from desktop request handling."""
+    creds = json.loads(Path(credentials).read_text())
+    base = creds["base_url"].rstrip("/")
+    if not base.endswith("/v1"):
+        base += "/v1"
+    checks = [
+        ("image", "/images/generations", {
+            "model": "grok-imagine-image-2.0", "prompt": "A small amber cube on a dark desk, no text",
+            "n": 1, "size": "1024x1024",
+        }),
+        ("video", "/videos/generations", {
+            "model": "grok-imagine-video-1.5", "prompt": "A static amber cube on a dark desk, subtle moving light",
+            "duration": 6, "aspect_ratio": "16:9",
+        }),
+    ]
+    results = []
+    for kind, path, body in checks:
+        entry = {"kind": kind, "model": body["model"]}
+        try:
+            request = urllib.request.Request(base + path, data=json.dumps(body).encode(), headers={
+                "Authorization": "Bearer " + creds["api_key"], "Content-Type": "application/json",
+            })
+            with urllib.request.urlopen(request, timeout=210) as response:
+                value = json.load(response)
+                entry.update(status=response.status, accepted=bool(value.get("data") or value.get("request_id") or value.get("id")))
+        except urllib.error.HTTPError as exc:
+            entry.update(status=exc.code, error=exc.read(2048).decode(errors="replace"))
+        except Exception as exc:
+            entry["error"] = f"{type(exc).__name__}: {exc}"
+        results.append(entry)
+        print(f"Independent {kind} request: HTTP {entry.get('status', 'unavailable')}", flush=True)
+    Path(output).write_text(json.dumps(results, ensure_ascii=False).replace(creds["api_key"], "[REDACTED]"), encoding="utf-8")
+
+
 def seal(credentials, source, output, context):
     creds = json.loads(Path(credentials).read_text())
     root = Path(source)
@@ -136,7 +171,7 @@ def seal(credentials, source, output, context):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["bootstrap", "receive", "probe", "seal"])
+    parser.add_argument("command", choices=["bootstrap", "receive", "probe", "probe-media", "seal"])
     parser.add_argument("--private-dir", required=True)
     parser.add_argument("--output")
     parser.add_argument("--source")
@@ -155,6 +190,8 @@ def main():
     elif args.command == "probe":
         if not probe(credentials, args.output):
             raise SystemExit(1)
+    elif args.command == "probe-media":
+        probe_media(credentials, args.output)
     elif args.command == "seal":
         if credentials.exists():
             seal(credentials, args.source, args.output, os.environ["GITHUB_RUN_ID"])

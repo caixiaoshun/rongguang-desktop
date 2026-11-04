@@ -9,6 +9,7 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+  actions: read
 jobs:
   live:
     runs-on: windows-latest
@@ -36,10 +37,21 @@ jobs:
         run: python desktop/scripts/live-audit-envelope.py receive --private-dir "$env:PRIVATE_DIR"
       - name: Discover actual provider models
         run: python desktop/scripts/live-audit-envelope.py probe --private-dir "$env:PRIVATE_DIR" --output "$env:EVIDENCE_DIR/provider-models.json"
-      - name: Download published installer
+      - name: Check media models independently of the desktop
+        run: python desktop/scripts/live-audit-envelope.py probe-media --private-dir "$env:PRIVATE_DIR" --output "$env:EVIDENCE_DIR/provider-media.json"
+      - name: Download Windows installer
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release download v0.1.5 --pattern '*x64-setup.exe' --dir artifacts
+        run: |
+          $config = Get-Content (Join-Path $env:PRIVATE_DIR 'credentials.json') -Raw | ConvertFrom-Json
+          if ($config.build_run_id) {
+            gh run watch "$($config.build_run_id)" --interval 15 --exit-status
+            if ($LASTEXITCODE -ne 0) { throw 'Installer build did not pass' }
+            gh run download "$($config.build_run_id)" --name rongguang-windows-x64 --dir artifacts
+          } else {
+            gh release download v0.1.5 --pattern '*x64-setup.exe' --dir artifacts
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'Could not download the selected Windows installer' }
       - name: Test configured native desktop UI
         shell: powershell
         run: |
