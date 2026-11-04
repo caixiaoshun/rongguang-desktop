@@ -312,10 +312,10 @@ try {
     } '连接验证成功'
     Check 'assistant-multi-turn' {
         $previousCount = @(Assistant-Messages).Count
-        Type-Control '助手消息；输入 @ 引用项目，输入 / 引用 Skill 或 MCP' '上一条消息要求你回复哪句话？请重复那句话。'
+        Type-Control '助手消息；输入 @ 引用项目，输入 / 引用 Skill 或 MCP' '在你的上一条回复后加上两个汉字“复测”，只输出拼接后的文字，去掉标点。'
         Click-Control '发送'
-        Wait-AssistantReply $previousCount '连接验证成功'
-    } '连接验证成功'
+        Wait-AssistantReply $previousCount '连接验证成功复测'
+    } '连接验证成功复测'
     Check 'assistant-close' { Click-Control '收起助手' } '打开融光助手'
     Check 'image-workbench-live' {
         Click-Control '工具' 'header'

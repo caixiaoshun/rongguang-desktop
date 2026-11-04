@@ -45,8 +45,14 @@ jobs:
         run: |
           $config = Get-Content (Join-Path $env:PRIVATE_DIR 'credentials.json') -Raw | ConvertFrom-Json
           if ($config.build_run_id) {
-            gh run watch "$($config.build_run_id)" --interval 15 --exit-status
-            if ($LASTEXITCODE -ne 0) { throw 'Installer build did not pass' }
+            $deadline = (Get-Date).AddMinutes(30)
+            do {
+              $result = gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$($config.build_run_id)" | ConvertFrom-Json
+              if ($LASTEXITCODE -ne 0) { throw 'Could not check installer build' }
+              if ($result.status -eq 'completed') { break }
+              Start-Sleep -Seconds 15
+            } until ((Get-Date) -gt $deadline)
+            if ($result.conclusion -ne 'success') { throw 'Installer build did not pass' }
             gh run download "$($config.build_run_id)" --name rongguang-windows-x64 --dir artifacts
           } else {
             gh release download v0.1.5 --pattern '*x64-setup.exe' --dir artifacts
