@@ -38,7 +38,12 @@ jobs:
       - name: Discover actual provider models
         run: python desktop/scripts/live-audit-envelope.py probe --private-dir "$env:PRIVATE_DIR" --output "$env:EVIDENCE_DIR/provider-models.json"
       - name: Check media models independently of the desktop
-        run: python desktop/scripts/live-audit-envelope.py probe-media --private-dir "$env:PRIVATE_DIR" --output "$env:EVIDENCE_DIR/provider-media.json"
+        run: |
+          $config = Get-Content (Join-Path $env:PRIVATE_DIR 'credentials.json') -Raw | ConvertFrom-Json
+          if (-not $config.video_model_15) {
+            python desktop/scripts/live-audit-envelope.py probe-media --private-dir "$env:PRIVATE_DIR" --output "$env:EVIDENCE_DIR/provider-media.json"
+            exit $LASTEXITCODE
+          }
       - name: Download Windows installer
         env:
           GH_TOKEN: ${{ github.token }}

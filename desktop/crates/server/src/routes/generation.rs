@@ -150,7 +150,7 @@ async fn run_image_task(
             }
             match state
                 .media
-                .persist(&client, &url, "images", Some(&cfg.api_key))
+                .persist(&client, &url, "images", cfg.media_auth(&url))
                 .await
             {
                 Ok(local) => {
@@ -440,7 +440,7 @@ async fn run_video_task(
                     let content = provider.content_url(&cfg, &platform_task_id, &url);
                     let local = state
                         .media
-                        .persist(&state.http, &content, "videos", Some(&cfg.api_key))
+                        .persist(&state.http, &content, "videos", cfg.media_auth(&content))
                         .await?;
                     let cover = extract_cover(&state, &local).await;
                     sqlx::query(

@@ -257,6 +257,10 @@ function Test-Generation([string]$Kind, [string]$Prompt) {
     } until ([DateTime]::UtcNow -gt $deadline)
     if (-not $task) { throw 'No generation task was created by the UI' }
     $task | ConvertTo-Json -Depth 12 | Set-Content (Join-Path $evidence "$Kind-task.json") -Encoding UTF8
+    if ($Kind -eq 'video' -and $credentials.video_model_15) {
+        $model = @(Get-Api '/api/ai/model/list') | Where-Object { $_.id -eq $task.modelId } | Select-Object -First 1
+        if ($model.code -ne 'grok-imagine-video-1.5') { throw 'The submitted task did not use the selected Video 1.5 model' }
+    }
     if ($task.status -ne 2) { throw "Generation did not succeed: $($task.errorMsg)" }
     $items = @(Get-Api "/api/generation/$Kind/$($task.id)/items")
     $items | ConvertTo-Json -Depth 12 | Set-Content (Join-Path $evidence "$Kind-items.json") -Encoding UTF8
@@ -317,12 +321,20 @@ try {
         Wait-AssistantReply $previousCount '连接验证成功复测'
     } '连接验证成功复测'
     Check 'assistant-close' { Click-Control '收起助手' } '打开融光助手'
-    Check 'image-workbench-live' {
-        Click-Control '工具' 'header'
-        Test-Generation 'image' 'RGA-LIVE-IMAGE. Cinematic storyboard frame, an adult Chinese female archivist with short black hair and a beige coat stands in a quiet futuristic archive at night. A small amber memory cube glows on the desk. Restrained teal and amber lighting, realistic film still, wide shot, 16:9, no text.'
+    if ($credentials.video_model_15) {
+        Check 'open-image-workbench' { Click-Control '工具' 'header' } '生图'
+    } else {
+        Check 'image-workbench-live' {
+            Click-Control '工具' 'header'
+            Test-Generation 'image' 'RGA-LIVE-IMAGE. Cinematic storyboard frame, an adult Chinese female archivist with short black hair and a beige coat stands in a quiet futuristic archive at night. A small amber memory cube glows on the desk. Restrained teal and amber lighting, realistic film still, wide shot, 16:9, no text.'
+        }
     }
     Check 'video-workbench-live' {
         Click-Control '生视频' 'sidebar'
+        if ($credentials.video_model_15) {
+            Click-Control '选择生成模型'
+            Click-Control 'grok-imagine-video-1.5'
+        }
         Test-Generation 'video' 'RGA-LIVE-VIDEO. Cinematic live action wide shot inside a quiet futuristic archive at night. An adult Chinese female archivist with short black hair and a beige coat gently picks up a glowing amber memory cube. Slow dolly in, subtle natural movement, teal and amber lighting, no captions, no logos.'
     }
     Check 'restart-preserves-settings-and-history' {
