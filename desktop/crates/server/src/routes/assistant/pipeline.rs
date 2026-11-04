@@ -1,7 +1,7 @@
 //! Durable pipeline transport. Execution and journaling outlive the SSE connection.
 use super::*;
 use std::{convert::Infallible, pin::Pin, time::Duration};
-use axum::response::sse::{Event, Sse};
+use axum::response::{IntoResponse, Response, sse::{Event, Sse}};
 use fusion_ai::agent::{AgentEvent, AgentRunner};
 use futures_util::Stream;
 use serde::Serialize;
@@ -82,7 +82,7 @@ pub(super) async fn append_event(state: &AppState, run_id: &str, mut value: serd
     Ok(value)
 }
 
-fn journal_stream(state: Arc<AppState>, run_id: String, after: i64) -> Sse<EventStream> {
+fn journal_stream(state: Arc<AppState>, run_id: String, after: i64) -> Response {
     let stream = async_stream::stream! {
         let mut cursor = after;
         loop {
@@ -111,7 +111,7 @@ fn journal_stream(state: Arc<AppState>, run_id: String, after: i64) -> Sse<Event
             }
         }
     };
-    Sse::new(Box::pin(stream) as EventStream).keep_alive(axum::response::sse::KeepAlive::default())
+    Sse::new(Box::pin(stream) as EventStream).keep_alive(axum::response::sse::KeepAlive::default()).into_response()
 }
 
 fn pipeline_message(req: &ChatReq) -> Result<String, AppError> {
@@ -170,7 +170,7 @@ async fn record_agent_event(state: &AppState, run_id: &str, event: AgentEvent) -
 
 pub(super) async fn run_pipeline(
     State(state): State<Arc<AppState>>, user: AuthUser, Json(req): Json<ChatReq>,
-) -> Result<Sse<EventStream>, AppError> {
+) -> Result<Response, AppError> {
     let message = pipeline_message(&req)?;
     let model = resolve_model(&state, req.model_id).await?;
     if model.model_type != 1 { return Err(AppError::bad_request("请选择对话模型")); }
@@ -247,7 +247,7 @@ pub(super) async fn run_pipeline(
 #[derive(Deserialize)]
 #[serde(rename_all="camelCase")]
 pub(super) struct ContinueQuery { conversation_id:String }
-pub(super) async fn continue_pipeline(State(state):State<Arc<AppState>>, user:AuthUser, Query(q):Query<ContinueQuery>) -> Result<Sse<EventStream>, AppError> {
+pub(super) async fn continue_pipeline(State(state):State<Arc<AppState>>, user:AuthUser, Query(q):Query<ContinueQuery>) -> Result<Response, AppError> {
     let snapshot: Option<String> = sqlx::query_scalar("SELECT agent_definition_snapshot_json FROM afv_agent_run WHERE conversation_id = ? ORDER BY id DESC LIMIT 1")
         .bind(&q.conversation_id).fetch_optional(&state.db).await?.flatten();
     let mut req: ChatReq = snapshot.and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
@@ -260,7 +260,7 @@ pub(super) async fn continue_pipeline(State(state):State<Arc<AppState>>, user:Au
 #[derive(Deserialize)]
 #[serde(rename_all="camelCase")]
 pub(super) struct ReconnectQuery { run_id:String, #[serde(default)] after_sequence:i64 }
-pub(super) async fn reconnect_pipeline(State(state):State<Arc<AppState>>, _user:AuthUser, Query(q):Query<ReconnectQuery>) -> Result<Sse<EventStream>, AppError> {
+pub(super) async fn reconnect_pipeline(State(state):State<Arc<AppState>>, _user:AuthUser, Query(q):Query<ReconnectQuery>) -> Result<Response, AppError> {
     let last: Option<i64> = sqlx::query_scalar("SELECT next_sequence - 1 FROM afv_agent_run WHERE run_id = ?").bind(&q.run_id).fetch_optional(&state.db).await?;
     let last=last.ok_or_else(||AppError::not_found("运行记录不存在"))?;
     if q.after_sequence<0 || q.after_sequence>last { return Err(AppError::bad_request("事件游标超出运行记录范围")); }
