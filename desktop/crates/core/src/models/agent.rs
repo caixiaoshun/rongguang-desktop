@@ -13,6 +13,7 @@ pub struct AgentConversation {
     pub agent_type: Option<String>,
     pub category: Option<String>,
     pub context_id: Option<i64>,
+    pub status: Option<String>,
     pub message_count: i64,
     pub last_message_time: Option<String>,
     pub create_time: String,

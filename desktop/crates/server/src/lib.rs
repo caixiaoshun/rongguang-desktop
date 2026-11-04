@@ -25,6 +25,7 @@ pub async fn start(
     let state = Arc::new(AppState::new(paths, config).await?);
     // 桌面版没有登录/初始化流程，启动即准备好本地账号与默认供应商。
     routes::system::ensure_local_bootstrap(&state).await?;
+    routes::assistant::recover_interrupted(&state).await?;
 
     // ffmpeg 自检：缺失不阻塞启动，但要在日志里说清楚，否则用户只在合成时才发现。
     {

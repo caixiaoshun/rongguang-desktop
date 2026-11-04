@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use sqlx::{Column, Row};
 
 use fusion_ai::agent::ToolExecutor;
-use fusion_ai::types::ToolDef;
+use fusion_ai::types::{ToolCall, ToolDef};
 use fusion_core::error::{AppError, AppResult};
 
 use crate::state::AppState;
@@ -18,6 +18,8 @@ use crate::support::now;
 pub struct AssistantTools {
     pub state: Arc<AppState>,
     pub user_id: i64,
+    pub run_id: String,
+    pub execution_mode: String,
 }
 
 fn def(name: &str, description: &str, properties: Value, required: Vec<&str>) -> ToolDef {
@@ -437,15 +439,27 @@ impl ToolExecutor for AssistantTools {
     }
 
     fn requires_confirmation(&self, name: &str) -> bool {
-        matches!(
-            name,
-            "DeleteProject"
-                | "DeleteScriptChildResource"
-                | "DeleteStoryboardChildResource"
-                | "DeleteAssetResource"
-                | "DeleteImageTask"
-                | "DeleteVideoTask"
-        )
+        let destructive = name.starts_with("Delete") || name.starts_with("Clear")
+            || name == "ManageScriptSceneItems";
+        let read_only = name.starts_with("Get") || name.starts_with("List")
+            || name.ends_with("Query") || name.starts_with("Preview");
+        match self.execution_mode.as_str() {
+            "FULL_ACCESS" => false,
+            "ALWAYS_ASK" => true,
+            "ALWAYS_ALLOW" => destructive,
+            _ => !read_only,
+        }
+    }
+
+    async fn authorize(&self, call: &ToolCall, reply_id: &str) -> AppResult<bool> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        self.state.pipeline_confirmations.lock().insert(reply_id.to_owned(), crate::state::PendingToolConfirmation {
+            run_id: self.run_id.clone(), tool_call_id: call.id.clone(), sender,
+        });
+        let approved = tokio::time::timeout(std::time::Duration::from_secs(300), receiver)
+            .await.ok().and_then(Result::ok).unwrap_or(false);
+        self.state.pipeline_confirmations.lock().remove(reply_id);
+        Ok(approved)
     }
 
     async fn execute(&self, name: &str, args: Value) -> AppResult<String> {

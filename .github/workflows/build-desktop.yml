@@ -2,7 +2,7 @@ name: Build Desktop
 
 on:
   push:
-    branches: [main, fix/desktop-interactions]
+    branches: [main, fix/desktop-interactions, fix/live-generation-tests]
     paths:
       - web/**
       - desktop/crates/**
