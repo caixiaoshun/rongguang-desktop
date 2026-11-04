@@ -5,6 +5,7 @@ pub mod ai;
 pub mod asset;
 pub mod assistant;
 pub mod auth;
+pub mod audio;
 pub mod comfyui;
 pub mod generation;
 pub mod project;
@@ -30,6 +31,7 @@ pub fn all() -> Router<Arc<AppState>> {
         .merge(agent_config::routes())
         .merge(comfyui::routes())
         .merge(auth::routes())
+        .merge(audio::routes())
         .merge(team::routes())
         .merge(project::routes())
         .merge(script::routes())

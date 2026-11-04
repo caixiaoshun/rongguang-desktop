@@ -146,8 +146,7 @@ jobs:
         if: matrix.os == 'ubuntu-22.04'
         working-directory: desktop
         run: |
-          cargo test -p fusion-core --lib
-          cargo test -p fusion-server --lib
+          cargo test --locked -p fusion-core -p fusion-ai -p fusion-server --lib
 
       # ---------- 随包 ffmpeg ----------
       # 必须静态构建：动态版换机器会因缺 .so/.dll 直接崩。

@@ -146,7 +146,7 @@ async fn list_conversations(
         "SELECT COUNT(*) FROM afv_agent_conversation WHERE deleted = 0 AND (? IS NULL OR COALESCE(NULLIF(category, ''), 'assistant') = ?)",
     ).bind(&category).bind(&category).fetch_one(&state.db).await?;
     let rows = sqlx::query_as::<_, AgentConversation>(
-        "SELECT * FROM afv_agent_conversation WHERE deleted = 0 AND (? IS NULL OR COALESCE(NULLIF(category, ''), 'assistant') = ?) ORDER BY update_time DESC, id DESC LIMIT ? OFFSET ?",
+        "SELECT * FROM afv_agent_conversation WHERE deleted = 0 AND (? IS NULL OR COALESCE(NULLIF(category, ''), 'assistant') = ?) ORDER BY CASE WHEN instr(update_time, 'T') = 0 THEN datetime(update_time, 'localtime') ELSE datetime(update_time) END DESC, id DESC LIMIT ? OFFSET ?",
     )
     .bind(&category).bind(&category).bind(size).bind(offset)
     .fetch_all(&state.db).await?;

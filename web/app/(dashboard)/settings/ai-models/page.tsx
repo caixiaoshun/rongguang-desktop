@@ -403,6 +403,8 @@ export default function AiModelsPage() {
       { type: 2, label: "图像生成" },
       { type: 3, label: "视频生成" },
       { type: 1, label: "对话" },
+      { type: 4, label: "语音合成" },
+      { type: 5, label: "语音识别" },
     ].map(g => ({
       ...g,
       models: configModels.filter(m => m.modelType === g.type),

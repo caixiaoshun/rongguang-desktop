@@ -19,21 +19,124 @@ use crate::routes::ai::{load_model, resolve_provider_config};
 use crate::state::AppState;
 use crate::support::{new_task_id, now, ok, ApiResult};
 
+/// Remote providers cannot fetch the desktop's relative media paths.
+async fn prepare_reference(state: &AppState, url: &str) -> Result<String, AppError> {
+    use base64::Engine;
+    let url = url.trim();
+    let (root, relative) = if let Some(path) = url.strip_prefix("/media/") {
+        (state.paths.media_dir.as_path(), path)
+    } else if let Some(path) = url.strip_prefix("/uploads/") {
+        (state.paths.upload_dir.as_path(), path)
+    } else if url.starts_with("https://")
+        || url.starts_with("http://")
+        || url.starts_with("data:image/")
+    {
+        return Ok(url.to_string());
+    } else {
+        return Err(AppError::bad_request("参考图片地址无效"));
+    };
+    let root = tokio::fs::canonicalize(root).await?;
+    let path = tokio::fs::canonicalize(root.join(relative))
+        .await
+        .map_err(|_| AppError::bad_request("参考图片不存在，请重新上传"))?;
+    if !path.starts_with(&root) {
+        return Err(AppError::bad_request("参考图片路径无效"));
+    }
+    let mime = mime_guess::from_path(&path).first_or_octet_stream();
+    if !mime.as_ref().starts_with("image/") {
+        return Err(AppError::bad_request("参考文件必须为图片"));
+    }
+    if tokio::fs::metadata(&path).await?.len() > 20 * 1024 * 1024 {
+        return Err(AppError::bad_request("参考图片不能超过 20MB"));
+    }
+    let bytes = tokio::fs::read(path).await?;
+    Ok(format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    ))
+}
+
+async fn prepare_references(state: &AppState, urls: Vec<String>) -> Result<Vec<String>, AppError> {
+    let mut result = Vec::with_capacity(urls.len());
+    for url in urls {
+        result.push(prepare_reference(state, &url).await?);
+    }
+    Ok(result)
+}
+
+pub async fn recover_interrupted(state: &AppState) -> Result<(), AppError> {
+    for table in ["afv_image_task", "afv_video_task", "afv_video_item"] {
+        sqlx::query(&format!("UPDATE {table} SET status = 3, error_msg = '应用退出导致任务中断，请重新生成', update_time = ? WHERE status IN (0, 1)"))
+            .bind(now()).execute(&state.db).await?;
+    }
+    Ok(())
+}
+
+async fn delete_image(
+    State(state): State<Arc<AppState>>,
+    _u: AuthUser,
+    Path(key): Path<String>,
+) -> ApiResult<bool> {
+    let task = resolve_image_task(&state, &key).await?;
+    if matches!(task.status, 0 | 1) {
+        state.mark_canceled(&task.task_id);
+    }
+    let mut tx = state.db.begin().await?;
+    sqlx::query("UPDATE afv_image_task SET deleted = 1, status = CASE WHEN status IN (0, 1) THEN 4 ELSE status END, update_time = ? WHERE id = ?")
+        .bind(now()).bind(task.id).execute(&mut *tx).await?;
+    sqlx::query("UPDATE afv_image_item SET deleted = 1 WHERE task_id = ?")
+        .bind(task.id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    ok(true)
+}
+
+async fn delete_video(
+    State(state): State<Arc<AppState>>,
+    _u: AuthUser,
+    Path(key): Path<String>,
+) -> ApiResult<bool> {
+    let task = resolve_video_task(&state, &key).await?;
+    if matches!(task.status, 0 | 1) {
+        state.mark_canceled(&task.task_id);
+    }
+    let mut tx = state.db.begin().await?;
+    sqlx::query("UPDATE afv_video_task SET deleted = 1, status = CASE WHEN status IN (0, 1) THEN 4 ELSE status END, update_time = ? WHERE id = ?")
+        .bind(now()).bind(task.id).execute(&mut *tx).await?;
+    sqlx::query("UPDATE afv_video_item SET deleted = 1 WHERE task_id = ?")
+        .bind(task.id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    ok(true)
+}
+
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/generation/image/submit", post(submit_image))
-        .route("/api/generation/image/{id}", get(get_image_task))
+        .route(
+            "/api/generation/image/{id}",
+            get(get_image_task).delete(delete_image),
+        )
         .route("/api/generation/image/{id}/items", get(image_items))
         .route("/api/generation/image/page", get(image_page))
         .route("/api/generation/image/{id}/cancel", post(cancel_image))
         .route("/api/generation/video/submit", post(submit_video))
-        .route("/api/generation/video/{id}", get(get_video_task))
+        .route(
+            "/api/generation/video/{id}",
+            get(get_video_task).delete(delete_video),
+        )
         .route("/api/generation/video/{id}/items", get(video_items))
         .route("/api/generation/video/page", get(video_page))
         .route("/api/generation/video/{id}/cancel", post(cancel_video))
 }
 
-fn size_from_request(width: Option<i64>, height: Option<i64>, ratio: Option<&str>) -> Option<String> {
+fn size_from_request(
+    width: Option<i64>,
+    height: Option<i64>,
+    ratio: Option<&str>,
+) -> Option<String> {
     if let (Some(w), Some(h)) = (width, height) {
         if w > 0 && h > 0 {
             return Some(format!("{w}x{h}"));
@@ -59,7 +162,7 @@ async fn submit_image(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
     Json(req): Json<ImageSubmitReq>,
-) -> ApiResult<ImageTask> {
+) -> ApiResult<String> {
     if req.prompt.trim().is_empty() {
         return Err(AppError::bad_request("提示词不能为空"));
     }
@@ -107,7 +210,7 @@ async fn submit_image(
         run_image_task(state_clone, task_row_id, prompt, refs, size, count).await;
     });
 
-    ok(task)
+    ok(task.task_id)
 }
 
 async fn run_image_task(
@@ -130,7 +233,7 @@ async fn run_image_task(
         let request = ImageRequest {
             model: model.code.clone(),
             prompt,
-            reference_images: refs,
+            reference_images: prepare_references(&state, refs).await?,
             size,
             count,
             extra: model
@@ -177,7 +280,7 @@ async fn run_image_task(
             set_image_status(&state, task_row_id, task_status::FAILED, Some("图片生成失败或落盘失败")).await?;
         } else {
             sqlx::query(
-                "UPDATE afv_image_task SET success_count = ?, status = ?, update_time = ? WHERE id = ?",
+                "UPDATE afv_image_task SET success_count = ?, status = ?, update_time = ? WHERE id = ? AND status IN (0, 1) AND deleted = 0",
             )
             .bind(success)
             .bind(task_status::SUCCESS)
@@ -191,7 +294,13 @@ async fn run_image_task(
     .await;
 
     if let Err(err) = started {
-        let _ = set_image_status(&state, task_row_id, task_status::FAILED, Some(&err.to_string())).await;
+        let _ = set_image_status(
+            &state,
+            task_row_id,
+            task_status::FAILED,
+            Some(&err.to_string()),
+        )
+        .await;
         tracing::warn!("图像任务失败: {err}");
     }
     if let Ok(task) = load_image_task(&state, task_row_id).await {
@@ -205,7 +314,7 @@ async fn set_image_status(
     status: i64,
     error: Option<&str>,
 ) -> Result<(), AppError> {
-    sqlx::query("UPDATE afv_image_task SET status = ?, error_msg = ?, update_time = ? WHERE id = ?")
+    sqlx::query("UPDATE afv_image_task SET status = ?, error_msg = ?, update_time = ? WHERE id = ? AND status IN (0, 1) AND deleted = 0")
         .bind(status)
         .bind(error)
         .bind(now())
@@ -290,13 +399,18 @@ async fn cancel_image(
     Path(key): Path<String>,
 ) -> ApiResult<bool> {
     let task = resolve_image_task(&state, &key).await?;
+    if !matches!(task.status, 0 | 1) {
+        return ok(true);
+    }
     state.mark_canceled(&task.task_id);
-    sqlx::query("UPDATE afv_image_task SET status = ?, update_time = ? WHERE id = ? AND status IN (0, 1)")
-        .bind(task_status::CANCELED)
-        .bind(now())
-        .bind(task.id)
-        .execute(&state.db)
-        .await?;
+    sqlx::query(
+        "UPDATE afv_image_task SET status = ?, update_time = ? WHERE id = ? AND status IN (0, 1)",
+    )
+    .bind(task_status::CANCELED)
+    .bind(now())
+    .bind(task.id)
+    .execute(&state.db)
+    .await?;
     ok(true)
 }
 
@@ -306,7 +420,7 @@ async fn submit_video(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
     Json(req): Json<VideoSubmitReq>,
-) -> ApiResult<VideoTask> {
+) -> ApiResult<String> {
     if req.prompt.trim().is_empty() && req.first_frame_image_url.is_none() {
         return Err(AppError::bad_request("提示词或首帧图至少提供一个"));
     }
@@ -372,7 +486,7 @@ async fn submit_video(
         .await;
     });
 
-    ok(task)
+    ok(task.task_id)
 }
 
 async fn run_video_task(
@@ -393,13 +507,16 @@ async fn run_video_task(
 
         set_video_status(&state, task_row_id, task_status::RUNNING, None).await?;
 
+        let first_frame = match first_frame { Some(url) => Some(prepare_reference(&state, &url).await?), None => None };
+        for item_index in 0..task.count.max(1) {
+        if state.is_canceled(&task.task_id) { return Ok(()); }
         let submit = VideoSubmit {
             model: model.code.clone(),
-            prompt,
-            image_url: first_frame,
+            prompt: prompt.clone(),
+            image_url: first_frame.clone(),
             duration,
-            aspect_ratio: ratio,
-            resolution,
+            aspect_ratio: ratio.clone(),
+            resolution: resolution.clone(),
             extra: serde_json::Value::Null,
         };
         let platform_task_id = provider.submit(&cfg, submit).await?;
@@ -421,6 +538,7 @@ async fn run_video_task(
         // 轮询节奏：前 30 秒 2 秒一轮（快速捕捉早完成的任务），之后 5 秒一轮。
         // 用固定节奏而非「请求后再 sleep」，避免单次请求抖动把周期越拖越长。
         let poll_started = std::time::Instant::now();
+        let mut completed = false;
         for round in 0..480 {
             let round_started = std::time::Instant::now();
             if state.is_canceled(&task.task_id) {
@@ -443,6 +561,7 @@ async fn run_video_task(
                         .persist(&state.http, &content, "videos", cfg.media_auth(&content))
                         .await?;
                     let cover = extract_cover(&state, &local).await;
+                    if state.is_canceled(&task.task_id) { return Ok(()); }
                     sqlx::query(
                         "UPDATE afv_video_item SET video_url = ?, cover_url = ?, duration = ?, status = 2, update_time = ? WHERE id = ?",
                     )
@@ -454,14 +573,16 @@ async fn run_video_task(
                     .execute(&state.db)
                     .await?;
                     sqlx::query(
-                        "UPDATE afv_video_task SET success_count = 1, status = ?, error_msg = NULL, update_time = ? WHERE id = ?",
+                        "UPDATE afv_video_task SET success_count = ?, status = ?, error_msg = NULL, update_time = ? WHERE id = ? AND status IN (0, 1) AND deleted = 0",
                     )
-                    .bind(task_status::SUCCESS)
+                    .bind(item_index + 1)
+                    .bind(if item_index + 1 == task.count.max(1) { task_status::SUCCESS } else { task_status::RUNNING })
                     .bind(now())
                     .bind(task_row_id)
                     .execute(&state.db)
                     .await?;
-                    return Ok(());
+                    completed = true;
+                    break;
                 }
                 Ok(VideoPoll::Failed { message }) => {
                     sqlx::query(
@@ -509,13 +630,22 @@ async fn run_video_task(
             }
         }
 
-        set_video_status(&state, task_row_id, task_status::FAILED, Some("视频生成超时")).await?;
+        if !completed { return Err(AppError::business("视频生成超时")); }
+        }
         Ok(())
     }
     .await;
 
     if let Err(err) = result {
-        let _ = set_video_status(&state, task_row_id, task_status::FAILED, Some(&err.to_string())).await;
+        let _ = sqlx::query("UPDATE afv_video_item SET status = 3, error_msg = ?, update_time = ? WHERE task_id = ? AND status IN (0, 1) AND deleted = 0")
+            .bind(err.to_string()).bind(now()).bind(task_row_id).execute(&state.db).await;
+        let _ = set_video_status(
+            &state,
+            task_row_id,
+            task_status::FAILED,
+            Some(&err.to_string()),
+        )
+        .await;
         tracing::error!("视频任务失败: {err}");
     }
     if let Ok(task) = load_video_task(&state, task_row_id).await {
@@ -543,7 +673,7 @@ async fn set_video_status(
     status: i64,
     error: Option<&str>,
 ) -> Result<(), AppError> {
-    sqlx::query("UPDATE afv_video_task SET status = ?, error_msg = ?, update_time = ? WHERE id = ?")
+    sqlx::query("UPDATE afv_video_task SET status = ?, error_msg = ?, update_time = ? WHERE id = ? AND status IN (0, 1) AND deleted = 0")
         .bind(status)
         .bind(error)
         .bind(now())
@@ -625,8 +755,13 @@ async fn cancel_video(
     Path(key): Path<String>,
 ) -> ApiResult<bool> {
     let task = resolve_video_task(&state, &key).await?;
+    if !matches!(task.status, 0 | 1) {
+        return ok(true);
+    }
     state.mark_canceled(&task.task_id);
     set_video_status(&state, task.id, task_status::CANCELED, Some("已取消")).await?;
+    sqlx::query("UPDATE afv_video_item SET status = 4, error_msg = '已取消', update_time = ? WHERE task_id = ? AND status IN (0, 1)")
+        .bind(now()).bind(task.id).execute(&state.db).await?;
     ok(true)
 }
 
@@ -652,5 +787,115 @@ pub async fn run_video_task_public(
     ratio: Option<String>,
     duration: Option<i64>,
 ) {
-    run_video_task(state, task_row_id, prompt, first_frame, ratio, duration, None).await;
+    run_video_task(
+        state,
+        task_row_id,
+        prompt,
+        first_frame,
+        ratio,
+        duration,
+        None,
+    )
+    .await;
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    use fusion_core::{config::AppConfig, paths::AppPaths};
+
+    async fn fixture() -> Arc<AppState> {
+        let root = std::env::temp_dir().join(format!("generation-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = AppPaths {
+            db_file: root.join("fusion.db"),
+            media_dir: root.join("media"),
+            upload_dir: root.join("uploads"),
+            workspace_dir: root.join("workspace"),
+            web_dir: root.join("web"),
+            logs_dir: root.join("logs"),
+            root,
+        };
+        Arc::new(AppState::new(paths, AppConfig::default()).await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn local_reference_is_embedded_and_cannot_escape_media_directory() {
+        let state = fixture().await;
+        let url = state
+            .media
+            .save_bytes("images", "png", b"example-image")
+            .unwrap();
+        assert_eq!(
+            prepare_reference(&state, &url).await.unwrap(),
+            "data:image/png;base64,ZXhhbXBsZS1pbWFnZQ=="
+        );
+        std::fs::write(state.paths.root.join("private.png"), b"secret").unwrap();
+        assert!(prepare_reference(&state, "/media/../private.png")
+            .await
+            .is_err());
+        assert!(prepare_reference(&state, "/media/images/missing.png")
+            .await
+            .is_err());
+        state.db.close().await;
+        std::fs::remove_dir_all(&state.paths.root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn canceled_tasks_stay_canceled_and_deletion_hides_history() {
+        let state = fixture().await;
+        let id = sqlx::query("INSERT INTO afv_image_task (task_id, status, count, success_count, deleted) VALUES ('img_test', 1, 1, 0, 0)")
+            .execute(&state.db).await.unwrap().last_insert_rowid();
+        let _ = cancel_image(
+            State(state.clone()),
+            AuthUser::anonymous(),
+            Path("img_test".into()),
+        )
+        .await
+        .unwrap();
+        set_image_status(&state, id, task_status::FAILED, Some("late response"))
+            .await
+            .unwrap();
+        assert_eq!(
+            load_image_task(&state, id).await.unwrap().status,
+            task_status::CANCELED
+        );
+        let _ = delete_image(
+            State(state.clone()),
+            AuthUser::anonymous(),
+            Path("img_test".into()),
+        )
+        .await
+        .unwrap();
+        assert!(load_image_task(&state, id).await.is_err());
+        state.db.close().await;
+        std::fs::remove_dir_all(&state.paths.root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_recovers_running_tasks_but_keeps_completed_results() {
+        let state = fixture().await;
+        for (name, status) in [("running", 1), ("completed", 2), ("canceled", 4)] {
+            sqlx::query("INSERT INTO afv_video_task (task_id, status, count, success_count, deleted) VALUES (?, ?, 1, 0, 0)")
+                .bind(name).bind(status).execute(&state.db).await.unwrap();
+        }
+        recover_interrupted(&state).await.unwrap();
+        assert_eq!(
+            resolve_video_task(&state, "running").await.unwrap().status,
+            3
+        );
+        assert_eq!(
+            resolve_video_task(&state, "completed")
+                .await
+                .unwrap()
+                .status,
+            2
+        );
+        assert_eq!(
+            resolve_video_task(&state, "canceled").await.unwrap().status,
+            4
+        );
+        state.db.close().await;
+        std::fs::remove_dir_all(&state.paths.root).unwrap();
+    }
 }

@@ -1,0 +1,47 @@
+AI 短剧项目开发验证记录（2026-11-04，北京时间）
+
+本轮修改
+- 生成提交接口统一返回业务任务编号，匹配前端轮询契约。
+- 补齐图片、视频历史删除接口。
+- 将本地参考图转换为模型可读取的数据；检查路径边界、文件类型和大小。
+- 防止取消任务被后台结果覆盖；启动时标记上次中断的生成任务。
+- 修复视频 count 参数被忽略的问题，并同步失败子任务状态。
+- 将上传请求上限调整为 200MB，与现有上传业务限制一致。
+- 修复流式中文字符跨网络分段时的乱码。
+- 补齐配音、语音转写接口和页面，模型设置中显示语音模型。
+- 增加开发环境 uploads 代理；调整整集合成请求等待时间。
+- 兼容数据库 UTC 默认时间与应用本地时间，修复会话排序。
+
+验证环境
+- 工作区源代码；服务器独立测试目录 /tmp/rongguang-audit-20261104。
+- Linux Rust 后端、Node 22、pnpm 10.32.1、系统 ffmpeg。
+- 未修改生产 grok2api 的账号、凭据或模型路由。
+
+通过的检查
+1. FUSION_DESKTOP_BUILD=1 pnpm build：通过，含 /generate/audio 静态页面和 TypeScript 检查。
+2. node --test scripts/*.test.mjs：11 项通过。
+3. cargo test -p fusion-core -p fusion-ai -p fusion-server：9 项通过。
+   包含中文分段解码、参考图越界拒绝、取消状态、重启恢复、会话契约。
+4. python scripts/smoke-api.py <测试服务地址>：21 次接口操作通过。
+   涵盖项目、剧本集、剧本场景、分镜集、分镜场景、镜头和列表查询。
+5. python scripts/smoke-generation.py <测试服务地址>：通过。
+   使用可控模拟模型，不代表真实上游生成成功。
+   覆盖 3MB 上传、本地参考图传输、2 张图片、2 个视频、媒体落盘、
+   封面提取、两个片段合成及删除历史；实际调用 ffmpeg 和 ffprobe。
+6. 真实 grok2api：grok-4.3 文本、grok-voice-latest 配音、grok-stt 转写成功。
+   同样通过软件业务接口验证：文本连通、36480 字节音频落盘、音频转写。
+
+未通过与待验收
+- grok-imagine-image、grok-imagine-image-2.0 实际生成失败。
+- grok-imagine-video 可以提交，但最终失败。
+- 上述失败均返回 xAI Console 上游 Incorrect API key provided。
+  调用 grok2api 的开发 Key 可鉴权，问题位于服务端使用的上游凭据。
+- 只读检查发现图片、视频使用 Console 路由；Web 备用路由及账号处于停用状态。
+- 尚未验证真实图生图、实际 AI 视频批量生成和真实 AI 视频整集合成。
+- 尚未完成 Windows Tauri 安装包构建和桌面界面逐项点击验收。
+- 尚未对所有 Agent 工具、外部 MCP、第三方供应商和升级流程进行完整验收。
+
+结论
+本轮修复和上述测试已完成；不能据此宣称全部功能可用。
+需要先恢复 grok2api 的图片/视频上游凭据，再继续真实生成和桌面全流程验收。
+两个 smoke 脚本应只用于独立测试数据；生成脚本会修改测试实例的 Grok 配置。

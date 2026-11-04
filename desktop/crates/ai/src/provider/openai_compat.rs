@@ -135,12 +135,12 @@ impl Provider for OpenAiCompatProvider {
                 Err::<(), _>(AppError::Http(describe_error(status, &text)))?;
                 unreachable!()
             };
-            let mut buffer = String::new();
+            let mut buffer = Vec::<u8>::new();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|e| AppError::Http(format!("读取流失败: {e}")))?;
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
-                while let Some(pos) = buffer.find('\n') {
-                    let line = buffer[..pos].trim().to_string();
+                buffer.extend_from_slice(&chunk);
+                while let Some(pos) = buffer.iter().position(|byte| *byte == b'\n') {
+                    let line = String::from_utf8_lossy(&buffer[..pos]).trim().to_string();
                     buffer.drain(..=pos);
                     if line.is_empty() || line.starts_with(':') {
                         continue;

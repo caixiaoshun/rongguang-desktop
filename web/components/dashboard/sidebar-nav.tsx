@@ -16,6 +16,7 @@ import {
   HardDrive,
   ImagePlus,
   Video,
+  Mic,
   PanelLeftClose,
   PanelLeftOpen,
 } from "lucide-react";
@@ -59,6 +60,7 @@ const assetItems: SidebarItem[] = [
 ];
 
 const generationItems: SidebarItem[] = [
+  { key: "audio", label: "配音与转写", icon: Mic, href: "/generate/audio", iconColor: "text-amber-400" },
   { key: "image", label: "生图", icon: ImagePlus, href: "/generate/image", iconColor: "text-fuchsia-400" },
   { key: "video", label: "生视频", icon: Video, href: "/generate/video", iconColor: "text-cyan-400" },
 ];

@@ -43,6 +43,10 @@ const webOnlyConfig: NextConfig = {
         source: "/media/:path*",
         destination: `${developmentBackendUrl!}/media/:path*`,
       },
+      {
+        source: "/uploads/:path*",
+        destination: `${developmentBackendUrl!}/uploads/:path*`,
+      },
     ];
   },
   async headers() {

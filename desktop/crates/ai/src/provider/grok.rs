@@ -76,6 +76,56 @@ impl Default for GrokProvider {
     }
 }
 
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn chinese_text_survives_a_split_utf8_character() {
+        for compat in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 8192];
+                socket.read(&mut request).await.unwrap();
+                let body = "data: {\"choices\":[{\"delta\":{\"content\":\"中文台词\"}}]}\n\ndata: [DONE]\n\n";
+                let split = body.find('中').unwrap() + 1;
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+                socket.write_all(&body.as_bytes()[..split]).await.unwrap();
+                socket.flush().await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                socket.write_all(&body.as_bytes()[split..]).await.unwrap();
+            });
+            let cfg = ProviderConfig {
+                platform: "grok".into(),
+                base_url,
+                api_key: "test".into(),
+                proxy_type: Some("none".into()),
+                proxy_host: None,
+                proxy_port: None,
+                proxy_username: None,
+                proxy_password: None,
+            };
+            let provider: Box<dyn Provider> = if compat {
+                Box::new(crate::provider::openai_compat::OpenAiCompatProvider::new())
+            } else {
+                Box::new(GrokProvider::new())
+            };
+            let mut stream = provider.chat_stream(cfg, ChatRequest::default());
+            let mut text = String::new();
+            while let Some(delta) = stream.next().await {
+                if let StreamDelta::Content(chunk) = delta.unwrap() {
+                    text.push_str(&chunk);
+                }
+            }
+            assert_eq!(text, "中文台词");
+            server.await.unwrap();
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl Provider for GrokProvider {
     fn platform(&self) -> &'static str {
@@ -159,12 +209,12 @@ impl Provider for GrokProvider {
                 Err::<(), _>(AppError::Http(describe_error(status, &text)))?;
                 unreachable!()
             };
-            let mut buffer = String::new();
+            let mut buffer = Vec::<u8>::new();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|e| AppError::Http(format!("读取流失败: {e}")))?;
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
-                while let Some(pos) = buffer.find('\n') {
-                    let line = buffer[..pos].trim_end_matches('\r').to_string();
+                buffer.extend_from_slice(&chunk);
+                while let Some(pos) = buffer.iter().position(|byte| *byte == b'\n') {
+                    let line = String::from_utf8_lossy(&buffer[..pos]).trim_end_matches('\r').to_string();
                     buffer.drain(..=pos);
                     let line = line.trim();
                     if line.is_empty() || line.starts_with(':') {

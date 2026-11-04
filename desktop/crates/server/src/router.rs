@@ -58,7 +58,8 @@ pub fn build(state: Arc<AppState>) -> Router {
         });
     }
 
-    app.layer(TraceLayer::new_for_http()).layer(cors)
+    app.layer(axum::extract::DefaultBodyLimit::max(200 * 1024 * 1024))
+        .layer(TraceLayer::new_for_http()).layer(cors)
 }
 
 async fn health() -> &'static str {

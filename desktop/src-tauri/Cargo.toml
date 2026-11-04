@@ -1,6 +1,6 @@
 [package]
 name = "rongguang"
-version = "0.1.4"
+version = "0.1.7"
 description = "融光 · AI 视频创作工作台（桌面版）"
 authors = ["RongGuang"]
 edition = "2021"
